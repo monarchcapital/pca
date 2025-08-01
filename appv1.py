@@ -8,18 +8,18 @@ import seaborn as sns
 
 def main():
     """
-    Main function to run the Streamlit PCA application.
+   PCA application.
     """
     st.set_page_config(layout="wide", page_title="Yield Curve PCA App")
     st.title("Yield Curve Principal Component Analysis (PCA) App")
     st.markdown(
         """
-        This application performs Principal Component Analysis on financial yield curve data.
-        Upload a CSV file, select your desired date range and maturities, and analyze the results.
+       
+        Upload a CSV file, select date range and maturities.
         """
     )
 
-    # --- Sidebar for user inputs ---
+    # Sidebar for user inputs
     st.sidebar.header("User Input Panel")
     uploaded_file = st.sidebar.file_uploader("Upload your data CSV file", type=["csv"])
 
@@ -38,13 +38,13 @@ def main():
         # Get initial data count for user feedback
         initial_rows = len(df)
         
-        # --- Filter out weekends (Saturdays and Sundays) ---
+        #Filter out weekends (Saturdays and Sundays)
         # Monday is 0 and Sunday is 6, so we keep only dayofweek < 5
         df = df[df.index.dayofweek < 5]
         filtered_rows_weekends = initial_rows - len(df)
         st.sidebar.info(f"Weekends have been automatically filtered out. Removed {filtered_rows_weekends} rows.")
 
-        # --- Optional holiday filter ---
+        # Optional holiday filter
         holiday_file = st.sidebar.file_uploader("Optional: Upload a CSV with holiday dates", type=["csv"])
         if holiday_file:
             try:
@@ -140,7 +140,7 @@ def main():
                 value=min(3, max_components)
             )
 
-        # --- Main content area for analysis ---
+        #Main content area for analysis
         data_filtered = df.loc[start_date_filter:end_date_filter, selected_maturities]
         
         rows_before_handling = len(data_filtered)
@@ -167,7 +167,7 @@ def main():
         pca = PCA(n_components=n_components)
         principal_components = pca.fit_transform(scaled_data)
 
-        # --- NEW: Navigation for different pages ---
+        #NEW: Navigation for different pages
         st.sidebar.header("Navigation")
         page = st.sidebar.radio("Go to", ["Analysis", "Next Day Forecast"])
 

@@ -110,7 +110,7 @@ def main():
         selected_maturities = st.sidebar.multiselect(
             "Select maturities for analysis",
             options=valid_maturities,
-            default=valid_maturities[:min(len(valid_maturities), 10)]
+            default=valid_maturities[:min(len(valid_maturities), 20)]
         )
         
         if not valid_maturities:

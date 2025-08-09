@@ -359,8 +359,14 @@ def show_pca_analysis_page():
         pc_scores_df = pd.DataFrame(principal_components, index=pca_df.index, columns=[f'PC{i+1}' for i in range(st.session_state.n_components)])
         st.dataframe(pc_scores_df, use_container_width=True)
         fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # --- MODIFIED: Plot using pc_scores_df.index and pc_scores_df.values to handle gaps ---
         for i in range(st.session_state.n_components):
-            ax.plot(pc_scores_df.index, pc_scores_df[f'PC{i+1}'], label=f'PC{i+1}')
+            # Create a new series for each PC with a continuous datetime index
+            # This will have NaNs for missing dates
+            reindexed_series = pc_scores_df[f'PC{i+1}'].reindex(pd.date_range(start=pc_scores_df.index.min(), end=pc_scores_df.index.max(), freq='D'))
+            ax.plot(reindexed_series.index, reindexed_series.values, marker='o', linestyle='-', label=f'PC{i+1}')
+            
         ax.set_title('Principal Components Time Series')
         ax.set_xlabel('Date')
         ax.set_ylabel('Score')
@@ -373,15 +379,18 @@ def show_pca_analysis_page():
     with st.container():
         st.subheader("Curve Reconstruction")
 
-        # --- NEW DATE SELECTOR ---
-        # Get all unique dates from the pca_df index and format them as strings for the selectbox
-        available_dates = pca_df.index.strftime("%Y-%m-%d").unique().tolist()
+        # --- MODIFIED: SORT DATES FOR THE SELECTBOX ---
+        # Get all unique dates from the pca_df index and sort them in descending order
+        available_dates = sorted(pca_df.index.unique().tolist(), reverse=True)
+        
+        # Format the sorted dates as strings for the selectbox
+        available_date_strs = [d.strftime("%Y-%m-%d") for d in available_dates]
         
         # Use st.selectbox to allow the user to select a date
         selected_date_str = st.selectbox(
             "Select a date for reconstruction",
-            options=available_dates,
-            index=len(available_dates) - 1 if available_dates else 0 # Default to the last date
+            options=available_date_strs,
+            index=0 # Default to the latest date
         )
         
         if not selected_date_str:
@@ -622,9 +631,15 @@ if yield_file:
     temp_df['DATE'], _ = robust_date_parser(temp_df, 'DATE')
     temp_df.dropna(subset=['DATE'], inplace=True)
     temp_df.set_index('DATE', inplace=True)
-
-    start_date_filter = st.sidebar.date_input("Start Date for PCA", value=temp_df.index.min().date())
-    end_date_filter = st.sidebar.date_input("End Date for PCA", value=temp_df.index.max().date())
+    
+    min_date = temp_df.index.min().date()
+    # --- MODIFIED: SET END DATE TO TODAY'S DATE ---
+    max_date = date.today()
+    if temp_df.index.max().date() < max_date:
+        max_date = temp_df.index.max().date()
+    
+    start_date_filter = st.sidebar.date_input("Start Date for PCA", value=min_date)
+    end_date_filter = st.sidebar.date_input("End Date for PCA", value=max_date)
 
 else:
     start_date_filter = None

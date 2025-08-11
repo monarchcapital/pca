@@ -379,7 +379,7 @@ def show_pca_analysis_page():
     with st.container():
         st.subheader("Curve Reconstruction")
 
-        # --- MODIFIED: SORT DATES FOR THE SELECTBOX ---
+        #MODIFIED: SORT DATES FOR THE SELECTBOX
         # Get all unique dates from the pca_df index and sort them in descending order
         available_dates = sorted(pca_df.index.unique().tolist(), reverse=True)
         
@@ -440,7 +440,7 @@ def show_pca_analysis_page():
             
     st.divider()
 
-    # --- Futures contract reconstruction comparison ---
+    # Futures contract reconstruction comparison
     with st.container():
         st.subheader("Futures Contract Reconstruction Comparison")
         
@@ -543,7 +543,7 @@ def show_spread_analysis_page():
     st.write("This page is for spread analysis, which is not yet implemented.")
 
 
-# --- Main App Logic ---
+# Main App Logic
 st.set_page_config(layout="wide") # This is a key change to make the app use the full width of the screen.
 
 st.title("Yield Curve PCA Analysis")
@@ -580,7 +580,7 @@ if 'available_maturities_in_df' not in st.session_state:
     st.session_state.available_maturities_in_df = None
 
 
-# --- Sidebar Content ---
+# Sidebar Content
 st.sidebar.header("Data Upload")
 col1, col2 = st.sidebar.columns(2)
 with col1:
@@ -645,7 +645,8 @@ else:
     start_date_filter = None
     end_date_filter = None
 
-# --- Action Buttons ---
+#Action Buttons
+
 st.sidebar.divider()
 col1, col2 = st.sidebar.columns(2)
 with col1:
@@ -695,3 +696,4 @@ if st.session_state.analysis_run:
         show_pca_analysis_page()
     elif st.session_state.page == "Spread Analysis":
         show_spread_analysis_page()
+

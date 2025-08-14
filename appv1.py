@@ -12,6 +12,12 @@ from scipy.interpolate import interp1d
 sns.set_style("whitegrid")
 plt.rcParams["figure.dpi"] = 120
 st.set_page_config(layout="wide", page_title="Brazil DI Futures PCA - Fixed Heatmap")
+# Start/Stop Analysis buttons
+analysis_started = st.sidebar.button("Start Analysis")
+stop_analysis = st.sidebar.button("Stop Analysis")
+if not analysis_started or stop_analysis:
+    st.info("Click 'Start Analysis' to run.")
+    st.stop()
 
 # ---------------- Helpers ----------------
 QUARTERLY_CODES = {"F": 1, "J": 4, "N": 7, "V": 10}
@@ -514,3 +520,4 @@ try:
     st.download_button("Download Residuals CSV", residuals.to_csv().encode(), "residuals.csv")
 except Exception:
     st.error("Could not prepare residuals CSV.")
+

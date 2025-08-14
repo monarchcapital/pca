@@ -339,10 +339,21 @@ st.dataframe(ev.to_frame("Explained Variance Ratio").T, use_container_width=True
 
 st.subheader("PCA Loadings Heatmap")
 loadings = pd.DataFrame(
-    pca.components_, columns=pca_df_filled.columns, index=[f"PC{i+1}" for i in range(pca.components_.shape[0])]
+    pca.components_, 
+    columns=pca_df_filled.columns, 
+    index=[f"PC{i+1}" for i in range(pca.components_.shape[0])]
 )
 fig, ax = plt.subplots(figsize=(10, max(3, 0.5 * loadings.shape[1])))
-sns.heatmap(loadings, cmap="coolwarm", center=0, xticklabels=loadings.columns, yticklabels=loadings.index, ax=ax)
+sns.heatmap(
+    loadings, 
+    cmap="coolwarm", 
+    center=0, 
+    xticklabels=loadings.columns, 
+    yticklabels=loadings.index, 
+    annot=True,  # display numbers on heatmap
+    fmt=".2f",    # two decimal places
+    ax=ax
+)
 st.pyplot(fig)
 
 # ---------------- Curve reconstruction (single date) ----------------
@@ -586,3 +597,4 @@ try:
     st.download_button("Download Residuals CSV", residuals.to_csv().encode(), "residuals.csv")
 except Exception:
     st.error("Could not prepare residuals CSV.")
+

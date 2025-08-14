@@ -1,699 +1,510 @@
-import streamlit as st
-import pandas as pd
+# appv1.py - Full fixed version (heatmap now shows values)
+import io
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from scipy.interpolate import interp1d
-import io
-from datetime import timedelta, date
-from pandas.tseries.offsets import BDay
 
-# Set a consistent style for plots
-sns.set_style("darkgrid")
+sns.set_style("whitegrid")
+plt.rcParams["figure.dpi"] = 120
+st.set_page_config(layout="wide", page_title="Brazil DI Futures PCA - Fixed Heatmap")
 
-def robust_date_parser(df, date_column):
-    """
-    Parses a date column using multiple known formats and returns the most successful result.
-    This function avoids a generic parser fallback that can cause warnings and inconsistencies.
-    """
-    formats_to_try = ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d', '%d %B %Y', '%d-%b-%y']
-    best_result = None
-    fewest_errors = float('inf')
+# ---------------- Helpers ----------------
+QUARTERLY_CODES = {"F": 1, "J": 4, "N": 7, "V": 10}
 
-    for fmt in formats_to_try:
-        parsed_dates = pd.to_datetime(df[date_column], format=fmt, errors='coerce')
-        num_errors = parsed_dates.isnull().sum()
+def safe_to_datetime(s):
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
-        if num_errors < fewest_errors:
-            best_result = parsed_dates
-            fewest_errors = num_errors
-
-        if num_errors == 0:
-            break  # found perfect format, exit early
-
-    if best_result is not None:
-        return best_result, fewest_errors
-
-    fallback = pd.to_datetime(df[date_column], errors='coerce')
-    return fallback, fallback.isnull().sum()
-
-def run_analysis(yield_data, expiry_data, holiday_data,
-                 standard_maturities_years, interpolation_method,
-                 use_smoothing, n_components, use_geometric_average,
-                 start_date_filter, end_date_filter):
-    """
-    DI-specific pipeline:
-    - convert DI futures quotes -> discount factors (DF)
-    - DF -> zero rates (annualized, discrete compounding consistent with DI)
-    - interpolate zero rates to standard maturities
-    - mean-center (no scaling) and run PCA
-    Returns: pca_df (zero rates at standard maturities), pca_model, principal_components,
-             scaler (mean-centering scaler), raw_yield_df, expiry_df, available_maturities, holidays_set
-    """
-    try:
-        # Load and normalize column names
-        df = pd.read_csv(io.StringIO(yield_data.getvalue().decode("utf-8")))
-        df.columns = [col.strip().upper() for col in df.columns]
-
-        expiry_df = pd.read_csv(io.StringIO(expiry_data.getvalue().decode("utf-8")))
-        expiry_df.columns = [col.strip().upper() for col in expiry_df.columns]
-
-        # Date parsing with improved logic
-        df['DATE'], _ = robust_date_parser(df, 'DATE')
-        expiry_df['DATE'], _ = robust_date_parser(expiry_df, 'DATE')
-
-        df.dropna(subset=['DATE'], inplace=True)
-        expiry_df.dropna(subset=['DATE'], inplace=True)
-
-        df.set_index('DATE', inplace=True)
-        # Normalize maturity strings
-        expiry_df['MATURITY'] = expiry_df['MATURITY'].astype(str).str.strip().str.upper()
-        expiry_df = expiry_df.set_index('MATURITY')
-
-        # remove duplicate columns and ensure numeric yields
-        df = df.loc[:, ~df.columns.duplicated()]
-        yield_cols = [c for c in df.columns if c != 'DATE']  # should be maturities
-        for col in yield_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # holidays
-        holidays_set = set()
-        if holiday_data:
-            try:
-                holiday_df = pd.read_csv(io.StringIO(holiday_data.getvalue().decode("utf-8")))
-                holiday_df.columns = [c.strip().upper() for c in holiday_df.columns]
-                holiday_parsed_dates, _ = robust_date_parser(holiday_df, 'DATE')
-                holidays_set = set(holiday_parsed_dates.dropna().dt.date)
-            except Exception:
-                st.warning("Could not parse holidays file. Proceeding without holiday filtering.")
-                holidays_set = set()
-
-        # apply date range filter with more robust error handling
-        if start_date_filter is not None and end_date_filter is not None:
-            if start_date_filter > end_date_filter:
-                st.error("Start date cannot be after end date.")
-                return (None,) * 8
-            df = df.loc[(df.index.date >= start_date_filter) & (df.index.date <= end_date_filter)]
-
-        if df.empty:
-            st.error("No yield data in selected date range after parsing.")
-            return (None,) * 8
-
-        # business day mask (remove weekends & holidays)
-        is_business_day = df.index.weekday < 5
-        is_not_holiday = ~pd.Series(df.index.date).isin(holidays_set).values
-        df = df[is_business_day & is_not_holiday]
-        if df.empty:
-            st.error("No business days left after holiday/weekend filtering.")
-            return (None,) * 8
-
-        # smoothing optional (applies to raw yields)
-        if use_smoothing:
-            df = df.rolling(window=3, min_periods=1, center=True).mean()
-
-        # match maturities
-        yield_maturities = set(df.columns)
-        expiry_maturities = set(expiry_df.index)
-        available_maturities_in_df = sorted(list(yield_maturities & expiry_maturities))
-        if not available_maturities_in_df:
-            st.error("No maturity names match between yield file and expiry file.")
-            return (None,) * 8
-
-        st.info(f"Matched maturities: {available_maturities_in_df}")
-
-        # Prepare output dataframe of standard maturities (zero rates)
-        # Ensure standard maturities are sorted for interpolation
-        std_mats = np.array(sorted(standard_maturities_years), dtype=float)
-        
-        pca_df = pd.DataFrame(index=df.index, columns=[f'{m:.2f}Y' for m in std_mats])
-
-        BUSINESS_YEAR_DAYS = 252
-
-        dates_skipped = 0
-        dates_with_nan = 0
-        
-        for i, date in enumerate(df.index):
-            ttm_list = []
-            zero_list = []
-            row = df.loc[date]
-
-            for mat in available_maturities_in_df:
-                expiry_date_val = expiry_df.loc[mat, 'DATE']
-                if pd.isnull(expiry_date_val):
-                    continue
-                expiry_dt = pd.to_datetime(expiry_date_val).date()
-                if expiry_dt < date.date():
-                    # expired - skip
-                    continue
-
-                # Correction: Exclude valuation date from the count
-                bd_range = pd.bdate_range(date + pd.Timedelta(days=1), pd.Timestamp(expiry_dt))
-                # Remove holidays from the range
-                if holidays_set:
-                    bd_range = [d for d in bd_range if d.date() not in holidays_set]
-
-                working_days_to_expiry = len(bd_range)
-                
-                if working_days_to_expiry <= 0:
-                    continue
-
-                raw_yield = row.get(mat, np.nan)
-                if pd.isnull(raw_yield):
-                    continue
-
-                # DI convention: annualized rate in percent (e.g. 14.5)
-                t = working_days_to_expiry / BUSINESS_YEAR_DAYS  # in years (fraction)
-                r = float(raw_yield) / 100.0
-
-                # compute discount factor consistent with DI quote:
-                # DF = (1 + r)^{-t}
-                DF = (1.0 + r) ** (-t)
-
-                # implied zero annual rate (discrete compounding): DF = (1 + zero)^{-t} -> zero = DF^{-1/t} - 1
-                # handle tiny t
-                if t <= 0:
-                    continue
-                try:
-                    zero = DF ** (-1.0 / t) - 1.0
-                except Exception:
-                    continue
-
-                # convert back to percentage
-                zero_list.append(zero * 100.0)
-                ttm_list.append(t)
-
-            # need at least 2 distinct points to interpolate
-            if len(ttm_list) > 1 and len(set(np.round(ttm_list, 10))) > 1:
-                # sort
-                order = np.argsort(ttm_list)
-                t_sorted = np.array(ttm_list)[order]
-                z_sorted = np.array(zero_list)[order]
-
-                # interpolation: do NOT extrapolate. Use fill_value=np.nan.
-                try:
-                    f = interp1d(t_sorted, z_sorted, kind=interpolation_method,
-                                 bounds_error=False, fill_value=np.nan, assume_sorted=True)
-                    interp_vals = f(std_mats)
-                    
-                    # Instead of skipping the date entirely, we'll keep the row but note the NaNs
-                    if np.any(np.isnan(interp_vals)):
-                        dates_with_nan += 1
-                        
-                    pca_df.loc[date] = interp_vals
-                except Exception:
-                    dates_skipped += 1
-                    continue
-            else:
-                dates_skipped += 1
-
-        st.info(f"Skipped {dates_skipped} dates due to insufficient points for interpolation.")
-        if dates_with_nan > 0:
-            st.info(f"Retained {dates_with_nan} dates with partial data where some standard maturities were outside the interpolation range. These will appear as NaNs.")
-
-
-        # drop empty rows
-        pca_df.dropna(how='all', inplace=True)
-        if pca_df.empty:
-            st.error("No interpolated zero-rate curves available after processing.")
-            return (None,) * 8
-
-        # Add warning for significant NaN filling before PCA
-        total_elements = pca_df.size
-        nan_count = pca_df.isnull().sum().sum()
-        if total_elements > 0:
-            nan_percentage = (nan_count / total_elements) * 100
-            if nan_percentage > 5:
-                st.warning(f"Warning: {nan_percentage:.2f}% of data contains missing values (NaNs). These will be filled with the column mean for PCA.")
-        
-        # Mean-center only (keep variance)
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler(with_std=False)  # center only
-        
-        # We need to fill NaNs for the PCA to work. A common approach is to fill with the mean.
-        pca_df_filled = pca_df.fillna(pca_df.mean())
-        
-        scaled_data = scaler.fit_transform(pca_df_filled.values.astype(float))
-        
-        # PCA
-        from sklearn.decomposition import PCA
-        n_components = min(n_components, scaled_data.shape[1])
-        pca = PCA(n_components=n_components)
-        principal_components = pca.fit_transform(scaled_data)
-
-        # return zero-rate dataframe (in percent), pca model and scores
-        return pca_df.astype(float), pca, principal_components, scaler, df, expiry_df, available_maturities_in_df, holidays_set
-
-    except Exception as e:
-        st.error(f"Error in DI-specific run_analysis: {e}")
-        return (None,) * 8
-
-# New helper function to calculate TTM based on business days, which is consistent with the `run_analysis` function.
-def calculate_futures_ttm(valuation_date, expiry_date, holidays_set):
-    """
-    Calculates the Time-to-Maturity (TTM) in years for a given contract.
-    This TTM is based on the number of business days between the valuation and expiry dates.
-    """
-    BUSINESS_YEAR_DAYS = 252
-    
-    # Correction: Exclude valuation date from the count
-    bd_range = pd.bdate_range(valuation_date + pd.Timedelta(days=1), pd.Timestamp(expiry_date))
-    # Remove holidays from the range
-    if holidays_set:
-        bd_range = [d for d in bd_range if d.date() not in holidays_set]
-
-    working_days_to_expiry = len(bd_range)
-    
-    if working_days_to_expiry <= 0:
+def normalize_rate_input(val, unit):
+    if pd.isna(val):
         return np.nan
-        
-    t = working_days_to_expiry / BUSINESS_YEAR_DAYS
-    return t
+    v = float(val)
+    if "Percent" in unit:
+        return v / 100.0
+    if "Basis" in unit:
+        return v / 10000.0
+    return v  # Decimal
 
-def show_pca_analysis_page():
-    st.header("PCA Analysis")
+def denormalize_to_percent(frac):
+    if pd.isna(frac):
+        return np.nan
+    return 100.0 * frac
 
-    # Check if required data is available
-    if 'pca_df' not in st.session_state or st.session_state.pca_df is None:
-        st.warning("Please run the analysis first to see results.")
-        return
-        
-    pca_df = st.session_state.pca_df
-    pca_model = st.session_state.pca_model
-    principal_components = st.session_state.principal_components
-    scaler = st.session_state.scaler
-    
-    # Use st.container() to group related content, which can help with layout
-    with st.container():
-        st.subheader("PCA Explained Variance")
-        explained_variance_df = pd.DataFrame({
-            'Component': range(1, len(pca_model.explained_variance_ratio_) + 1),
-            'Explained Variance': pca_model.explained_variance_ratio_,
-            'Cumulative Explained Variance': np.cumsum(pca_model.explained_variance_ratio_)
-        })
-        # Use use_container_width=True to make the dataframe responsive
-        st.dataframe(explained_variance_df, use_container_width=True)
+def np_busdays_exclusive(start_dt, end_dt, holidays_np):
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return 0
+    s = np.datetime64(pd.Timestamp(start_dt).date()) + np.timedelta64(1, "D")
+    e = np.datetime64(pd.Timestamp(end_dt).date())
+    if e < s:
+        return 0
+    return int(np.busday_count(s, e, weekmask="1111100", holidays=holidays_np))
 
-        # Plot explained variance
-        fig, ax = plt.subplots(figsize=(10, 6)) # Adjusted figsize for better display
-        ax.bar(explained_variance_df['Component'], explained_variance_df['Explained Variance'], label='Individual')
-        ax.plot(explained_variance_df['Component'], explained_variance_df['Cumulative Explained Variance'],
-                marker='o', color='red', label='Cumulative')
-        ax.set_title('Explained Variance by Principal Component')
-        ax.set_xlabel('Principal Component')
-        ax.set_ylabel('Explained Variance Ratio')
-        ax.set_xticks(explained_variance_df['Component'])
-        ax.legend()
-        plt.tight_layout()
-        st.pyplot(fig)
+def calculate_ttm(valuation_ts, expiry_ts, holidays_np, year_basis):
+    bd = np_busdays_exclusive(valuation_ts, expiry_ts, holidays_np)
+    return np.nan if bd <= 0 else bd / float(year_basis)
 
-    st.divider() # Use a divider to visually separate sections
+def ensure_business_day_back(date64, holidays_np):
+    d = np.datetime64(date64)
+    if np.is_busday(d, weekmask="1111100", holidays=holidays_np):
+        return d
+    for _ in range(30):
+        d = d - np.timedelta64(1, "D")
+        if np.is_busday(d, weekmask="1111100", holidays=holidays_np):
+            return d
+    return d
 
-    with st.container():
-        st.subheader("Principal Components (Eigenvectors)")
-        pc_df = pd.DataFrame(pca_model.components_, columns=pca_df.columns,
-                             index=[f'PC{i+1}' for i in range(len(pca_model.components_))]).T
-        
-        st.dataframe(pc_df, use_container_width=True)
-        
-        num_maturities = len(pc_df.index)
-        # Dynamically adjust plot width based on number of maturities to prevent overlap
-        fig_width = max(10, num_maturities * 0.7) 
-        
-        fig, ax = plt.subplots(figsize=(fig_width, 6))
-        for i in range(st.session_state.n_components):
-            ax.plot(pc_df.index, pc_df[f'PC{i+1}'], label=f'PC{i+1}')
-        ax.set_title('Principal Component Curves (Eigenvectors)')
-        ax.set_xlabel('Maturity (Years)')
-        ax.set_ylabel('Weight')
-        ax.legend()
-        ax.set_xticks(pc_df.index)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout() # Adjust layout to prevent labels from overlapping
-        st.pyplot(fig)
-        
-    st.divider()
+def safe_busday_offset_back(date64, offset, holidays_np):
+    start = ensure_business_day_back(date64, holidays_np)
+    return np.busday_offset(start, -int(offset), weekmask="1111100", holidays=holidays_np)
 
-    with st.container():
-        st.subheader("Principal Component Loadings vs. Standard Maturities")
-        pc_loadings_df = pd.DataFrame(pca_model.components_, columns=pca_df.columns, index=[f'PC{i+1}' for i in range(len(pca_model.components_))])
-        num_components = len(pc_loadings_df.index)
-        num_maturities = len(pc_loadings_df.columns)
-        fig_width = max(12, num_maturities * 0.7)
-        fig_height = max(6, num_components * 1.5)
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-        # --- MODIFIED: fmt=".3f" for 3 decimal places ---
-        sns.heatmap(pc_loadings_df, annot=True, cmap='viridis', fmt=".3f", ax=ax)
-        ax.set_title('PCA Eigenvector Loadings by Maturity')
-        ax.set_xlabel('Maturity (Years)')
-        ax.set_ylabel('Principal Component')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        st.pyplot(fig)
+def adjusted_roll_date(expiry_ts, roll_bd_before, holidays_np):
+    if pd.isna(expiry_ts):
+        return pd.NaT
+    d64 = np.datetime64(pd.Timestamp(expiry_ts).date())
+    try:
+        roll64 = safe_busday_offset_back(d64, roll_bd_before, holidays_np)
+    except Exception:
+        roll64 = ensure_business_day_back(d64, holidays_np)
+        for _ in range(int(roll_bd_before)):
+            roll64 = ensure_business_day_back(roll64 - np.timedelta64(1, "D"), holidays_np)
+    return pd.Timestamp(roll64)
 
-    st.divider()
+def extract_month_code(maturity_name: str) -> str:
+    for ch in str(maturity_name):
+        if ch.isalpha():
+            return ch.upper()
+    return ""
 
-    with st.container():
-        st.subheader("Principal Component Time Series")
-        pc_scores_df = pd.DataFrame(principal_components, index=pca_df.index, columns=[f'PC{i+1}' for i in range(st.session_state.n_components)])
-        st.dataframe(pc_scores_df, use_container_width=True)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        # --- MODIFIED: Plot using pc_scores_df.index and pc_scores_df.values to handle gaps ---
-        for i in range(st.session_state.n_components):
-            # Create a new series for each PC with a continuous datetime index
-            # This will have NaNs for missing dates
-            reindexed_series = pc_scores_df[f'PC{i+1}'].reindex(pd.date_range(start=pc_scores_df.index.min(), end=pc_scores_df.index.max(), freq='D'))
-            ax.plot(reindexed_series.index, reindexed_series.values, marker='o', linestyle='-', label=f'PC{i+1}')
-            
-        ax.set_title('Principal Components Time Series')
-        ax.set_xlabel('Date')
-        ax.set_ylabel('Score')
-        ax.legend()
-        plt.tight_layout()
-        st.pyplot(fig)
-        
-    st.divider()
+def select_quarterly_generics_roll(valuation_ts, expiry_df, holidays_np, roll_bd_before=5):
+    rows = []
+    for mat, r in expiry_df.iterrows():
+        exp = r["DATE"]
+        if pd.isna(exp):
+            continue
+        code = extract_month_code(mat)
+        if code not in QUARTERLY_CODES:
+            continue
+        roll = adjusted_roll_date(exp, roll_bd_before, holidays_np)
+        rows.append((mat, pd.Timestamp(exp), roll))
+    if not rows:
+        return None, None
+    rows.sort(key=lambda x: x[1])
+    vdt = pd.Timestamp(valuation_ts)
+    idx = None
+    for i, (_, _, roll) in enumerate(rows):
+        if vdt <= roll:
+            idx = i
+            break
+    if idx is None:
+        idx = len(rows) - 1
+    front = rows[idx][0]
+    second = rows[idx + 1][0] if idx + 1 < len(rows) else None
+    return front, second
 
-    with st.container():
-        st.subheader("Curve Reconstruction")
+def select_quarterly_generics_calendar(valuation_ts, expiry_df):
+    m = pd.Timestamp(valuation_ts).month
+    if m <= 3:
+        first_code, second_code = "J", "N"
+    elif m <= 6:
+        first_code, second_code = "N", "V"
+    elif m <= 9:
+        first_code, second_code = "V", "F"
+    else:
+        first_code, second_code = "F", "J"
 
-        #MODIFIED: SORT DATES FOR THE SELECTBOX
-        # Get all unique dates from the pca_df index and sort them in descending order
-        available_dates = sorted(pca_df.index.unique().tolist(), reverse=True)
-        
-        # Format the sorted dates as strings for the selectbox
-        available_date_strs = [d.strftime("%Y-%m-%d") for d in available_dates]
-        
-        # Use st.selectbox to allow the user to select a date
-        selected_date_str = st.selectbox(
-            "Select a date for reconstruction",
-            options=available_date_strs,
-            index=0 # Default to the latest date
-        )
-        
-        if not selected_date_str:
-            st.warning("No dates available for reconstruction.")
-            return
+    def pick_next_for_code(code):
+        sub = expiry_df[expiry_df.index.map(lambda x: extract_month_code(x) == code)]
+        if sub.empty:
+            return None
+        sub = sub.copy()
+        sub["DATE"] = pd.to_datetime(sub["DATE"], errors="coerce")
+        sub = sub[sub["DATE"] >= pd.Timestamp(valuation_ts)]
+        if sub.empty:
+            return None
+        return sub.sort_values("DATE").index[0]
 
-        reconstruction_date = pd.to_datetime(selected_date_str)
-        
-        # Get the original zero rate curve for that date
-        original_curve = pca_df.loc[reconstruction_date]
-        mean_curve = scaler.mean_
+    return pick_next_for_code(first_code), pick_next_for_code(second_code)
 
-        # Reconstruct the curve
-        if st.session_state.n_components is not None:
-            num_components_to_use = st.slider("Number of components to use for reconstruction", 1, st.session_state.n_components, st.session_state.n_components)
-            
-            # Get the principal component scores for the selected date
-            pca_scores_for_date = principal_components[pca_df.index.get_loc(reconstruction_date)][:num_components_to_use]
-            
-            # Get the eigenvectors for the components used
-            pca_components = pca_model.components_[:num_components_to_use]
-            
-            # Reconstruct the scaled curve
-            reconstructed_scaled_curve = np.dot(pca_scores_for_date, pca_components)
-            
-            # Add the mean back to get the final reconstructed curve
-            reconstructed_curve_values = reconstructed_scaled_curve + mean_curve
-            reconstructed_curve = pd.Series(reconstructed_curve_values, index=pca_df.columns)
-            
-            reconstructed_df = pd.DataFrame({
-                'Maturity': pca_df.columns,
-                'Original Curve': original_curve.values,
-                'Reconstructed Curve': reconstructed_curve_values
-            }).set_index('Maturity')
+# ---------------- Sidebar ----------------
+st.sidebar.header("Upload / Settings")
+yield_file = st.sidebar.file_uploader("Yield data CSV (dates + contract columns)", type="csv")
+expiry_file = st.sidebar.file_uploader("Expiry mapping CSV (maturity, date)", type="csv")
+holiday_file = st.sidebar.file_uploader("Holiday dates CSV (optional)", type="csv")
 
-            fig, ax = plt.subplots(figsize=(12, 6)) # Adjusted figsize for better display
-            sns.lineplot(data=reconstructed_df, x='Maturity', y='Original Curve', marker='o', label="Original Zero-Rate Curve", ax=ax, markersize=8)
-            sns.lineplot(data=reconstructed_df, x='Maturity', y='Reconstructed Curve', marker='x', label=f"Reconstructed Curve ({num_components_to_use} PCs)", ax=ax, markersize=8, linestyle='--')
-            ax.set_title(f"Curve Reconstruction for {reconstruction_date.strftime('%Y-%m-%d')}")
-            ax.set_xlabel("Maturity (Years)")
-            ax.set_ylabel("Zero Rate (%)")
-            ax.set_xticks(reconstructed_df.index)
-            ax.set_xticklabels(reconstructed_df.index, rotation=45, ha='right')
-            ax.legend()
-            plt.tight_layout()
-            st.pyplot(fig)
-            
-    st.divider()
+std_maturities_txt = st.sidebar.text_input("Standard maturities (years, comma-separated):", "0.25,0.5,1,2,3,4,5")
+interpolation_method = st.sidebar.selectbox("Interpolation method:", ["linear", "cubic", "quadratic", "nearest"])
+apply_smoothing = st.sidebar.checkbox("Apply smoothing (3-day centered)", value=False)
+use_geometric = st.sidebar.checkbox("Use geometric average (where applicable)", value=False)
+n_components = st.sidebar.slider("Number of PCA components:", 1, 10, 3)
 
-    # Futures contract reconstruction comparison
-    with st.container():
-        st.subheader("Futures Contract Reconstruction Comparison")
-        
-        # Add a radio button to select the graph type
-        chart_type = st.radio(
-            "Select graph type:",
-            ('Bar Chart', 'Line Graph'),
-            key='futures_chart_type'
-        )
+rate_unit = st.sidebar.selectbox("Input rate unit:", ["Percent (e.g. 13.45)", "Decimal (e.g. 0.1345)", "Basis points (e.g. 1345)"])
+year_basis = int(st.sidebar.selectbox("Business days in year:", [252, 360], index=0))
 
-        try:
-            # Get the necessary data from session state
-            original_yield_df = st.session_state.raw_yield_df.copy()
-            expiry_df = st.session_state.expiry_df.copy()
-            holidays_set = st.session_state.holidays_set
-            available_maturities = st.session_state.available_maturities_in_df
-            
-            # Filter original yield data for the reconstruction date
-            actual_yields = original_yield_df.loc[reconstruction_date, available_maturities]
-            
-            # Calculate TTM for each available futures contract on the reconstruction date
-            futures_ttm = {}
-            for mat in available_maturities:
-                expiry_date = expiry_df.loc[mat, 'DATE']
-                ttm = calculate_futures_ttm(reconstruction_date, pd.to_datetime(expiry_date), holidays_set)
-                if not np.isnan(ttm):
-                    futures_ttm[mat] = ttm
+generics_method = st.sidebar.radio("Generics selection method:", ["Roll-window (BDs before expiry)", "Calendar quarter mapping"])
+roll_bd_before = st.sidebar.number_input("Roll-window: business days before expiry", min_value=1, max_value=15, value=5, step=1)
 
-            if not futures_ttm:
-                st.warning("No unexpired futures contracts found for the selected date to perform comparison.")
-                return
+if not yield_file or not expiry_file:
+    st.info("Please upload Yield CSV and Expiry CSV on the left.")
+    st.stop()
 
-            # Sort the futures by their TTM
-            sorted_futures = sorted(futures_ttm.items(), key=lambda item: item[1])
-            futures_labels = [item[0] for item in sorted_futures]
-            ttm_values = [item[1] for item in sorted_futures]
-            
-            # Get the TTMs and zero rates from the interpolated curve for interpolation
-            interpolated_maturities = [float(m.replace('Y','')) for m in reconstructed_curve.index]
-            interpolated_rates = reconstructed_curve.values
-            
-            # Reconstruct the curve for the exact futures TTMs
-            if len(interpolated_maturities) > 1 and len(set(interpolated_maturities)) > 1:
-                interp_func = interp1d(interpolated_maturities, interpolated_rates, kind='linear', fill_value='extrapolate')
-                reconstructed_futures_values = interp_func(ttm_values)
-            else:
-                st.error("Not enough data points in the reconstructed curve for interpolation.")
-                return
-            
-            # Get the actual market values for the same futures contracts
-            actual_futures_values = [actual_yields.get(mat, np.nan) for mat in futures_labels]
-            
-            # Prepare data for plotting
-            plot_data = pd.DataFrame({
-                'Contract': futures_labels,
-                'Actual Value': actual_futures_values,
-                'Reconstructed Value': reconstructed_futures_values
-            })
-            
-            # Plot the comparison based on user selection
-            fig, ax = plt.subplots(figsize=(12, 7)) # Adjusted figsize for better display
-            if chart_type == 'Bar Chart':
-                plot_data.plot(x='Contract', y=['Actual Value', 'Reconstructed Value'], kind='bar', ax=ax, width=0.8, color=['dodgerblue', 'tomato'])
-            else: # Line Graph
-                sns.lineplot(data=plot_data, x='Contract', y='Actual Value', marker='o', ax=ax, label='Actual Value', color='dodgerblue')
-                sns.lineplot(data=plot_data, x='Contract', y='Reconstructed Value', marker='x', ax=ax, label='Reconstructed Value', color='tomato', linestyle='--')
-                plt.xticks(rotation=45, ha='right')
+# ---------------- Load & parse ----------------
+def load_csv_file(f):
+    return pd.read_csv(io.StringIO(f.getvalue().decode("utf-8")))
 
-            ax.set_title(f"Actual vs. Reconstructed Values for Futures Contracts on {reconstruction_date.strftime('%Y-%m-%d')}")
-            ax.set_xlabel("Futures Contract")
-            ax.set_ylabel("Yield (%)")
-            ax.legend()
-            ax.grid(axis='y', linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-            st.markdown("---")
-            st.subheader("Comparison Table for All Contracts")
-            
-            # Create a table with the values for all contracts
-            if not plot_data.empty:
-                comparison_table = plot_data.rename(columns={
-                    'Actual Value': 'Actual Value (%)',
-                    'Reconstructed Value': 'Reconstructed Value (%)'
-                }).set_index('Contract')
-                st.dataframe(comparison_table, use_container_width=True)
-            else:
-                st.info("No futures contracts available to display in the comparison table.")
-            
-        except Exception as e:
-            st.error(f"An error occurred during futures contract reconstruction and plotting: {e}")
-            st.info("Please ensure your 'expiry' data contains a 'DATE' column and that the maturity names match between your yield and expiry data files.")
-            
-
-def show_spread_analysis_page():
-    """
-    Displays the spread analysis graphs.
-    """
-    st.subheader("Spread Analysis")
-    st.write("This page is for spread analysis, which is not yet implemented.")
-
-
-# Main App Logic
-st.set_page_config(layout="wide") # This is a key change to make the app use the full width of the screen.
-
-st.title("Yield Curve PCA Analysis")
-
-st.markdown("This application allows you to perform Principal Component Analysis on yield curve data.")
-
-# --- Session State Initialization ---
-# Ensure all session state variables are initialized before use.
-if 'analysis_run' not in st.session_state:
-    st.session_state.analysis_run = False
-if 'page' not in st.session_state:
-    st.session_state.page = "PCA Analysis"
-if 'pca_df' not in st.session_state:
-    st.session_state.pca_df = None
-if 'reconstruction_date_str' not in st.session_state:
-    st.session_state.reconstruction_date_str = None
-if 'n_components' not in st.session_state:
-    st.session_state.n_components = 3
-if 'standard_maturities_years' not in st.session_state:
-    st.session_state.standard_maturities_years = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]
-if 'interpolation_method' not in st.session_state:
-    st.session_state.interpolation_method = 'linear'
-if 'use_smoothing' not in st.session_state:
-    st.session_state.use_smoothing = False
-if 'use_geometric_average' not in st.session_state:
-    st.session_state.use_geometric_average = False
-if 'holidays_set' not in st.session_state:
-    st.session_state.holidays_set = set()
-if 'raw_yield_df' not in st.session_state:
-    st.session_state.raw_yield_df = None
-if 'expiry_df' not in st.session_state:
-    st.session_state.expiry_df = None
-if 'available_maturities_in_df' not in st.session_state:
-    st.session_state.available_maturities_in_df = None
-
-
-# Sidebar Content
-st.sidebar.header("Data Upload")
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    yield_file = st.sidebar.file_uploader("Upload Yield Data (CSV)", type=["csv"])
-with col2:
-    expiry_file = st.sidebar.file_uploader("Upload Expiry Data (CSV)", type=["csv"])
-    
-holiday_file = st.sidebar.file_uploader("Upload Holidays (CSV, optional)", type=["csv"])
-
-# --- Analysis Parameters ---
-st.sidebar.header("Analysis Parameters")
-
-maturities_str = st.sidebar.text_input(
-    "Standard Maturities (years, comma-separated)", 
-    value=",".join(map(str, st.session_state.standard_maturities_years))
-)
+# yields
 try:
-    st.session_state.standard_maturities_years = [float(m.strip()) for m in maturities_str.split(',') if m.strip()]
-except (ValueError, IndexError):
-    st.sidebar.error("Invalid format for maturities. Please use a comma-separated list of numbers.")
-    st.session_state.standard_maturities_years = []
+    yields_df = load_csv_file(yield_file)
+except Exception as e:
+    st.error(f"Error reading yield CSV: {e}")
+    st.stop()
 
-st.session_state.interpolation_method = st.sidebar.selectbox(
-    "Interpolation Method",
-    options=['linear', 'cubic', 'quadratic'],
-    help="Select the method for interpolating zero rates to standard maturities."
-)
+date_col = yields_df.columns[0]
+yields_df[date_col] = safe_to_datetime(yields_df[date_col])
+yields_df = yields_df.dropna(subset=[date_col])
+yields_df.set_index(date_col, inplace=True)
+yields_df.columns = [str(c).strip() for c in yields_df.columns]
+for c in yields_df.columns:
+    yields_df[c] = pd.to_numeric(yields_df[c], errors="coerce")
 
-st.session_state.use_smoothing = st.sidebar.checkbox(
-    "Apply 3-day moving average smoothing to raw yields"
-)
+# expiry (keep first two cols)
+try:
+    expiry_raw = load_csv_file(expiry_file)
+except Exception as e:
+    st.error(f"Error reading expiry CSV: {e}")
+    st.stop()
 
-n_maturities = len(st.session_state.standard_maturities_years) if st.session_state.standard_maturities_years else 3
-st.session_state.n_components = st.sidebar.slider(
-    "Number of Principal Components",
-    min_value=1,
-    max_value=n_maturities,
-    value=min(3, n_maturities),
-    help="Select the number of principal components for the analysis."
-)
+if expiry_raw.shape[1] < 2:
+    st.error("Expiry CSV must have at least two columns: maturity and expiry date.")
+    st.stop()
 
-# Date filters for PCA training
-st.sidebar.header("Date Filters for PCA Training")
-if yield_file:
-    # Need to load a temp df to get min/max dates
-    temp_df = pd.read_csv(io.StringIO(yield_file.getvalue().decode("utf-8")))
-    temp_df.columns = [col.strip().upper() for col in temp_df.columns]
-    temp_df['DATE'], _ = robust_date_parser(temp_df, 'DATE')
-    temp_df.dropna(subset=['DATE'], inplace=True)
-    temp_df.set_index('DATE', inplace=True)
-    
-    min_date = temp_df.index.min().date()
-    # --- MODIFIED: SET END DATE TO TODAY'S DATE ---
-    max_date = date.today()
-    if temp_df.index.max().date() < max_date:
-        max_date = temp_df.index.max().date()
-    
-    start_date_filter = st.sidebar.date_input("Start Date for PCA", value=min_date)
-    end_date_filter = st.sidebar.date_input("End Date for PCA", value=max_date)
+expiry_df = expiry_raw.iloc[:, :2].copy()
+expiry_df.columns = ["MATURITY", "DATE"]
+expiry_df["MATURITY"] = expiry_df["MATURITY"].astype(str).str.strip().str.upper()
+expiry_df["DATE"] = safe_to_datetime(expiry_df["DATE"])
+expiry_df = expiry_df.dropna(subset=["DATE"])
+expiry_df.set_index("MATURITY", inplace=True)
 
+# holidays
+holidays_np = np.array([], dtype="datetime64[D]")
+if holiday_file:
+    try:
+        hol_df = load_csv_file(holiday_file)
+        hol_series = safe_to_datetime(hol_df.iloc[:, 0]).dropna()
+        if not hol_series.empty:
+            holidays_np = np.array(hol_series.dt.date, dtype="datetime64[D]")
+    except Exception:
+        holidays_np = np.array([], dtype="datetime64[D]")
+
+# ---------------- Date range sidebar (based on yields) ----------------
+min_date_available = yields_df.index.min().date()
+max_date_available = yields_df.index.max().date()
+
+start_date_filter = st.sidebar.date_input("Start date filter", value=min_date_available, min_value=min_date_available, max_value=max_date_available)
+end_date_filter = st.sidebar.date_input("End date filter", value=max_date_available, min_value=min_date_available, max_value=max_date_available)
+if start_date_filter > end_date_filter:
+    st.sidebar.error("Start date cannot be after end date.")
+    st.stop()
+
+# filter yields
+yields_df = yields_df.loc[(yields_df.index.date >= start_date_filter) & (yields_df.index.date <= end_date_filter)]
+if yields_df.empty:
+    st.error("No yields in the selected date range.")
+    st.stop()
+
+if apply_smoothing:
+    yields_df = yields_df.rolling(window=3, min_periods=1, center=True).mean()
+
+# ---------------- Standard maturities ----------------
+try:
+    std_maturities = [float(x.strip()) for x in std_maturities_txt.split(",") if x.strip() != ""]
+    std_arr = np.array(sorted(std_maturities), dtype=float)
+    std_cols = [f"{m:.2f}Y" for m in std_arr]
+except Exception:
+    st.error("Error parsing standard maturities. Use comma-separated numbers like: 0.25,0.5,1,2")
+    st.stop()
+
+# ---------------- Build PCA interpolation matrix ----------------
+pca_df = pd.DataFrame(np.nan, index=yields_df.index, columns=std_cols, dtype=float)
+for dt in yields_df.index:
+    row = yields_df.loc[dt]
+    ttm_list = []
+    zero_list = []
+    for col in yields_df.columns:
+        mat_up = str(col).strip().upper()
+        if mat_up not in expiry_df.index:
+            continue
+        exp = expiry_df.loc[mat_up, "DATE"]
+        if pd.isna(exp) or pd.Timestamp(exp).date() < dt.date():
+            continue
+        bd = np_busdays_exclusive(dt, exp, holidays_np)
+        if bd <= 0:
+            continue
+        t = bd / float(year_basis)
+        raw_val = row.get(col, np.nan)
+        if pd.isna(raw_val):
+            continue
+        r_frac = normalize_rate_input(raw_val, rate_unit)
+        DF = (1.0 + r_frac) ** (-t)
+        try:
+            zero_frac = DF ** (-1.0 / t) - 1.0
+        except Exception:
+            continue
+        ttm_list.append(t)
+        zero_list.append(denormalize_to_percent(zero_frac))
+    if len(ttm_list) > 1 and len(set(np.round(ttm_list, 12))) > 1:
+        try:
+            order = np.argsort(ttm_list)
+            f = interp1d(np.array(ttm_list)[order], np.array(zero_list)[order], kind=interpolation_method, bounds_error=False, fill_value=np.nan, assume_sorted=True)
+            pca_df.loc[dt] = f(std_arr)
+        except Exception:
+            continue
+
+# Fill NaNs with column means (and overall mean fallback)
+pca_vals = pca_df.values.astype(float)
+col_means = np.nanmean(pca_vals, axis=0)
+if np.isnan(col_means).any():
+    overall_mean = np.nanmean(col_means[~np.isnan(col_means)]) if np.any(~np.isnan(col_means)) else 0.0
+    col_means = np.where(np.isnan(col_means), overall_mean, col_means)
+inds = np.where(np.isnan(pca_vals))
+if inds[0].size > 0:
+    pca_vals[inds] = np.take(col_means, inds[1])
+pca_df_filled = pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
+pca_df_filled = pca_df_filled.replace([np.inf, -np.inf], np.nan)
+pca_df_filled = pca_df_filled.fillna(pca_df_filled.mean())
+
+# ---------------- PCA computation ----------------
+try:
+    scaler = StandardScaler(with_std=False)
+    X = scaler.fit_transform(pca_df_filled.values.astype(float))
+    n_comp = int(min(n_components, X.shape[1]))
+    pca = PCA(n_components=n_comp)
+    PCs = pca.fit_transform(X)
+except Exception as e:
+    st.error(f"PCA failed: {e}")
+    st.stop()
+
+# ---------------- Display PCA info ----------------
+st.subheader("PCA Explained Variance")
+ev = pd.Series(pca.explained_variance_ratio_, index=[f"PC{i+1}" for i in range(len(pca.explained_variance_ratio_))])
+st.dataframe(ev.to_frame("Explained Variance Ratio").T, use_container_width=True)
+
+st.subheader("PCA Loadings Heatmap")
+loadings = pd.DataFrame(pca.components_, columns=pca_df_filled.columns, index=[f"PC{i+1}" for i in range(pca.components_.shape[0])])
+fig, ax = plt.subplots(figsize=(10, max(3, 0.5 * loadings.shape[1])))
+sns.heatmap(loadings, cmap="coolwarm", center=0, xticklabels=loadings.columns, yticklabels=loadings.index, ax=ax)
+st.pyplot(fig)
+
+# ---------------- Reconstructed overlay ----------------
+st.subheader("Original vs PCA Reconstructed Curve")
+default_recon = pca_df_filled.index.max().date()
+recon_date = st.date_input("Select date for reconstruction", value=default_recon, min_value=pca_df_filled.index.min().date(), max_value=pca_df_filled.index.max().date())
+recon_ts = pd.Timestamp(recon_date)
+mask = pca_df_filled.index.normalize() == recon_ts.normalize()
+if not mask.any():
+    st.warning("Selected date not available in PCA output.")
 else:
-    start_date_filter = None
-    end_date_filter = None
+    reconstructed_curve = pca_df_filled.loc[mask].iloc[0].values
+    # find raw row using normalized date matching
+    raw_mask = yields_df.index.normalize() == recon_ts.normalize()
+    if not raw_mask.any():
+        st.warning("Selected date not present in raw yields.")
+    else:
+        raw_row = yields_df.loc[raw_mask].iloc[0]
+        ttm_list = []
+        zero_list = []
+        for col in yields_df.columns:
+            mat_up = str(col).strip().upper()
+            if mat_up not in expiry_df.index:
+                continue
+            exp = expiry_df.loc[mat_up, "DATE"]
+            if pd.isna(exp) or pd.Timestamp(exp).date() < recon_ts.date():
+                continue
+            t = calculate_ttm(recon_ts, exp, holidays_np, year_basis)
+            if np.isnan(t) or t <= 0:
+                continue
+            raw_val = raw_row[col]
+            if pd.isna(raw_val):
+                continue
+            r_frac = normalize_rate_input(raw_val, rate_unit)
+            DF = (1.0 + r_frac) ** (-t)
+            try:
+                zero_frac = DF ** (-1.0 / t) - 1.0
+            except Exception:
+                continue
+            ttm_list.append(t)
+            zero_list.append(denormalize_to_percent(zero_frac))
+        orig_on_std = np.full_like(std_arr, np.nan, dtype=float)
+        if len(ttm_list) >= 2:
+            try:
+                orig_fn = interp1d(np.array(ttm_list), np.array(zero_list), kind="linear", bounds_error=False, fill_value=np.nan)
+                orig_on_std = orig_fn(std_arr)
+            except Exception:
+                orig_on_std = np.full_like(std_arr, np.nan, dtype=float)
 
-#Action Buttons
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(std_arr, reconstructed_curve, marker="o", label="PCA Reconstructed")
+        ax.plot(std_arr, orig_on_std, marker="x", label="Original (interpolated)")
+        ax.set_xticks(std_arr)
+        ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45)
+        ax.set_xlabel("Maturity")
+        ax.set_ylabel("Zero Rate (%)")
+        ax.set_title(f"Original vs PCA Reconstructed Curve ({recon_ts.date()})")
+        ax.legend()
+        ax.grid(alpha=0.4)
+        st.pyplot(fig)
 
-st.sidebar.divider()
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    if st.sidebar.button("Run Analysis", help="Click to perform PCA on the yield curve data."):
-        if yield_file is not None and expiry_file is not None:
-            (st.session_state.pca_df, st.session_state.pca_model, 
-             st.session_state.principal_components, st.session_state.scaler, 
-             st.session_state.raw_yield_df, st.session_state.expiry_df, 
-             st.session_state.available_maturities_in_df, st.session_state.holidays_set) = run_analysis(
-                yield_file, expiry_file, holiday_file, 
-                st.session_state.standard_maturities_years, st.session_state.interpolation_method, 
-                st.session_state.use_smoothing, st.session_state.n_components, 
-                st.session_state.use_geometric_average,
-                start_date_filter, end_date_filter
-            )
-            st.session_state.analysis_run = True
-            
-            # Set a default reconstruction date if the analysis was successful
-            if st.session_state.pca_df is not None and not st.session_state.pca_df.empty:
-                st.session_state.reconstruction_date_str = st.session_state.pca_df.index[0].strftime("%Y-%m-%d")
-            else:
-                st.session_state.analysis_run = False
+# ---------------- All maturities comparison ----------------
+st.subheader("Futures Contract Reconstruction Comparison — All Maturities")
+comparison_chart_type = st.radio("Chart type (All maturities):", ("Bar Chart", "Line Graph"), horizontal=True)
+
+# prepare actuals and recon at TTMs
+fut_ttm = {}
+fut_actual = {}
+if 'raw_row' in locals():
+    for col in yields_df.columns:
+        mat_up = str(col).strip().upper()
+        if mat_up not in expiry_df.index:
+            continue
+        exp = expiry_df.loc[mat_up, "DATE"]
+        t = calculate_ttm(recon_ts, exp, holidays_np, year_basis)
+        if pd.isna(t):
+            continue
+        fut_ttm[col] = t
+        fut_actual[col] = denormalize_to_percent(normalize_rate_input(raw_row[col], rate_unit))
+sorted_futs = [k for k, _ in sorted(fut_ttm.items(), key=lambda kv: kv[1])]
+ttms_sorted = [fut_ttm[k] for k in sorted_futs]
+actual_sorted = [fut_actual[k] for k in sorted_futs]
+if len(sorted_futs) > 0 and mask.any():
+    recon_fn_for_date = interp1d(std_arr, pca_df_filled.loc[mask].iloc[0].values, kind="linear", bounds_error=False, fill_value=np.nan)
+    reconstructed_at_ttms = recon_fn_for_date(ttms_sorted)
+    comp_df_all = pd.DataFrame({"Contract": sorted_futs, "TTM": ttms_sorted, "Actual (%)": actual_sorted, "Reconstructed (%)": reconstructed_at_ttms}).set_index("Contract")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    if comparison_chart_type == "Bar Chart":
+        x = np.arange(len(comp_df_all))
+        w = 0.4
+        ax.bar(x - w/2, comp_df_all["Actual (%)"], w, label="Actual")
+        ax.bar(x + w/2, comp_df_all["Reconstructed (%)"], w, label="Reconstructed")
+        ax.set_xticks(x); ax.set_xticklabels(comp_df_all.index, rotation=45, ha="right")
+    else:
+        ax.plot(comp_df_all.index, comp_df_all["Actual (%)"], marker="o", label="Actual")
+        ax.plot(comp_df_all.index, comp_df_all["Reconstructed (%)"], marker="x", linestyle="--", label="Reconstructed")
+        ax.tick_params(axis="x", rotation=45)
+    ax.set_ylabel("Yield (%)")
+    ax.set_title(f"All Maturities — Actual vs Reconstructed ({recon_ts.date()})")
+    ax.legend()
+    st.pyplot(fig)
+    st.dataframe(comp_df_all, use_container_width=True)
+else:
+    st.info("No valid futures maturities found for the selected date (after filtering).")
+
+# ---------------- 3M & 6M generics comparison ----------------
+st.subheader("3M & 6M Generics Comparison")
+gen_chart_type = st.radio("Chart type (Generics):", ("Bar Chart", "Line Graph"), horizontal=True)
+
+if generics_method.startswith("Roll"):
+    front, second = select_quarterly_generics_roll(recon_ts, expiry_df, holidays_np, roll_bd_before)
+else:
+    front, second = select_quarterly_generics_calendar(recon_ts, expiry_df)
+
+if front is None:
+    st.warning("Could not find generic quarterly contracts for this date.")
+else:
+    generics = [g for g in (front, second) if g is not None]
+    gen_actual = []
+    gen_recon = []
+    gen_ttms = []
+    for g in generics:
+        # find matching column in yields_df (case-insensitive)
+        cols_match = [c for c in yields_df.columns if str(c).strip().upper() == str(g).strip().upper()]
+        if not cols_match:
+            st.warning(f"Generic contract {g} not found in yield columns.")
+            continue
+        col = cols_match[0]
+        exp = expiry_df.loc[str(g).strip().upper(), "DATE"]
+        t = calculate_ttm(recon_ts, exp, holidays_np, year_basis)
+        if pd.isna(t):
+            continue
+        val = yields_df.loc[raw_mask, col].iloc[0] if raw_mask.any() else np.nan
+        gen_actual.append(denormalize_to_percent(normalize_rate_input(val, rate_unit)))
+        gen_recon.append(interp1d(std_arr, pca_df_filled.loc[mask].iloc[0].values, kind="linear", bounds_error=False, fill_value=np.nan)(t))
+        gen_ttms.append(t)
+
+    if len(gen_actual) == 0:
+        st.warning("No valid generics actuals to plot.")
+    else:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        if gen_chart_type == "Bar Chart":
+            x = np.arange(len(gen_actual))
+            w = 0.35
+            ax.bar(x - w/2, gen_actual, w, label="Actual")
+            ax.bar(x + w/2, gen_recon, w, label="Reconstructed")
+            ax.set_xticks(x); ax.set_xticklabels([f"{g}" for g in generics], rotation=45)
         else:
-            st.warning("Please upload both yield and expiry data files.")
-            st.session_state.analysis_run = False
-            
-with col2:
-    if st.sidebar.button("Reset Analysis", help="Click to clear results and start over."):
-        # Clear all analysis-related session state variables
-        keys_to_clear = [
-            'pca_df', 'pca_model', 'principal_components', 'scaler', 'analysis_run',
-            'reconstruction_date_str', 'raw_yield_df', 'expiry_df', 'holidays_set',
-            'available_maturities_in_df'
-        ]
-        for key in keys_to_clear:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.experimental_rerun() # Rerun to clear the screen
+            ax.plot([str(g) for g in generics], gen_actual, "o-", label="Actual")
+            ax.plot([str(g) for g in generics], gen_recon, "x--", label="Reconstructed")
+            ax.tick_params(axis="x", rotation=45)
+        ax.set_ylabel("Yield (%)")
+        ax.set_title(f"3M & 6M Generics — {recon_ts.date()}")
+        ax.legend()
+        st.pyplot(fig)
+        gen_df = pd.DataFrame({"Contract": generics, "TTM": gen_ttms, "Actual (%)": gen_actual, "Reconstructed (%)": gen_recon}).set_index("Contract")
+        st.dataframe(gen_df, use_container_width=True)
 
-# The main page content
-if st.session_state.analysis_run:
-    st.divider()
-    page_selection = st.radio("Select Analysis View", ["PCA Analysis", "Spread Analysis"], index=0)
-    st.session_state.page = page_selection
-    
-    if st.session_state.page == "PCA Analysis":
-        show_pca_analysis_page()
-    elif st.session_state.page == "Spread Analysis":
-        show_spread_analysis_page()
+# ---------------- Residual heatmap (fixed, shows values) ----------------
+st.subheader("Residual Heatmap (Actual % - Reconstructed %)")
+residuals = pd.DataFrame(index=pca_df_filled.index, columns=yields_df.columns, dtype=float)
 
+# Precompute recon interpolation per date; match raw rows by normalized date
+for dt in pca_df_filled.index:
+    recon_row = pca_df_filled.loc[dt].values
+    recon_fn = interp1d(std_arr, recon_row, kind="linear", bounds_error=False, fill_value=np.nan)
+    # find raw row matching by normalized date
+    raw_mask_dt = yields_df.index.normalize() == dt.normalize()
+    raw_row = yields_df.loc[raw_mask_dt].iloc[0] if raw_mask_dt.any() else None
+    for col in yields_df.columns:
+        mat_up = str(col).strip().upper()
+        if mat_up not in expiry_df.index:
+            residuals.loc[dt, col] = np.nan
+            continue
+        exp = expiry_df.loc[mat_up, "DATE"]
+        t = calculate_ttm(dt, exp, holidays_np, year_basis)
+        if pd.isna(t):
+            residuals.loc[dt, col] = np.nan
+            continue
+        actual_val = raw_row[col] if (raw_row is not None and col in raw_row.index) else np.nan
+        actual_pct = denormalize_to_percent(normalize_rate_input(actual_val, rate_unit)) if not pd.isna(actual_val) else np.nan
+        recon_pct = float(recon_fn(t)) if not np.isnan(t) else np.nan
+        residuals.loc[dt, col] = (actual_pct - recon_pct) if (not pd.isna(actual_pct) and not pd.isna(recon_pct)) else np.nan
+
+# heatmap date-range filter
+st.markdown("**Heatmap date-range filter (to speed display):**")
+hm_start = st.date_input("Heatmap start", value=residuals.index.min().date(), min_value=residuals.index.min().date(), max_value=residuals.index.max().date())
+hm_end = st.date_input("Heatmap end", value=residuals.index.max().date(), min_value=residuals.index.min().date(), max_value=residuals.index.max().date())
+if hm_start > hm_end:
+    st.error("Heatmap start must be <= end.")
+else:
+    hm_slice = residuals.loc[(residuals.index.date >= hm_start) & (residuals.index.date <= hm_end)]
+    if hm_slice.empty:
+        st.warning("No data in the selected heatmap range.")
+    else:
+        fig, ax = plt.subplots(figsize=(12, max(4, 0.2 * hm_slice.shape[1])))
+        sns.heatmap(hm_slice.T, cmap="RdBu_r", center=0, xticklabels=False, yticklabels=True, ax=ax)
+        ax.set_xlabel("Date")
+        st.pyplot(fig)
+
+# ---------------- Downloads ----------------
+st.markdown("---")
+st.subheader("Downloads")
+try:
+    st.download_button("Download PCA (interpolated) CSV", pca_df_filled.to_csv().encode(), "pca_interpolated.csv")
+except Exception:
+    st.error("Could not prepare PCA CSV.")
+
+try:
+    st.download_button("Download Residuals CSV", residuals.to_csv().encode(), "residuals.csv")
+except Exception:
+    st.error("Could not prepare residuals CSV.")

@@ -15,35 +15,6 @@ st.set_page_config(layout="wide", page_title="Brazil DI Futures PCA - Fixed Heat
 
 # ---------------- Helpers ----------------
 QUARTERLY_CODES = {"F": 1, "J": 4, "N": 7, "V": 10}
-# ---------------- Sidebar ----------------
-st.sidebar.header("Upload / Settings")
-yield_file = st.sidebar.file_uploader("Yield data CSV (dates + contract columns)", type="csv")
-expiry_file = st.sidebar.file_uploader("Expiry mapping CSV (maturity, date)", type="csv")
-holiday_file = st.sidebar.file_uploader("Holiday dates CSV (optional)", type="csv")
-
-std_maturities_txt = st.sidebar.text_input(
-    "Standard maturities (years, comma-separated):",
-    "0.25,0.50,0.75,1.00,1.25,1.50,1.75,2.00,2.25,2.50,2.75,3.00,4.00,5.00,7.00",
-)
-interpolation_method = st.sidebar.selectbox("Interpolation method:", ["linear", "cubic", "quadratic", "nearest"])
-apply_smoothing = st.sidebar.checkbox("Apply smoothing (3-day centered)", value=False)
-use_geometric = st.sidebar.checkbox("Use geometric average (where applicable)", value=False)
-n_components = st.sidebar.slider("Number of PCA components:", 1, 10, 3)
-rate_unit = st.sidebar.selectbox("Input rate unit:", ["Percent (e.g. 13.45)", "Decimal (e.g. 0.1345)", "Basis points (e.g. 1345)"])
-year_basis = int(st.sidebar.selectbox("Business days in year:", [252, 360], index=0))
-generics_method = st.sidebar.radio("Generics selection method:", ["Roll-window (BDs before expiry)", "Calendar quarter mapping"])
-roll_bd_before = st.sidebar.number_input("Roll-window: business days before expiry", min_value=1, max_value=15, value=5, step=1)
-
-# Start Analysis button appears after all required inputs are provided
-if yield_file and expiry_file and std_maturities_txt:
-    analysis_started = st.sidebar.button("Start Analysis")
-    if not analysis_started:
-        st.info("Adjust parameters and click 'Start Analysis' to run.")
-        st.stop()
-else:
-    st.info("Please upload all required files and set parameters.")
-    st.stop()
-
 
 def safe_to_datetime(s):
     return pd.to_datetime(s, errors="coerce", dayfirst=True)

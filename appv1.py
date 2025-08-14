@@ -8,16 +8,12 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from scipy.interpolate import interp1d
 
-# ==========================
 # App setup
-# ==========================
 st.set_page_config(layout="wide", page_title="Brazil DI Futures PCA")
 sns.set_style("whitegrid")
 plt.rcParams["figure.dpi"] = 120
 
-# ==========================
 # Helpers
-# ==========================
 QUARTERLY_CODES = {"F": 1, "J": 4, "N": 7, "V": 10}
 
 
@@ -148,9 +144,7 @@ def select_quarterly_generics_calendar(valuation_ts, expiry_df):
     return pick_next_for_code(first_code), pick_next_for_code(second_code)
 
 
-# ==========================
 # Sidebar: inputs (pre-flight)
-# ==========================
 st.sidebar.header("Upload / Settings")
 
 # File uploads (unique keys)
@@ -263,9 +257,7 @@ if not st.session_state.analysis_started:
     st.info("Upload files, set parameters and training date range, then click **Start Analysis**.")
     st.stop()
 
-# ==========================
 # Load full data (post-start)
-# ==========================
 
 def load_csv_file(f):
     return pd.read_csv(io.StringIO(f.getvalue().decode("utf-8")))
@@ -316,9 +308,7 @@ except Exception:
     st.error("Error parsing standard maturities.")
     st.stop()
 
-# ==========================
 # Build matrix for PCA (interpolated zero curves)
-# ==========================
 pca_df = pd.DataFrame(np.nan, index=yields_df.index, columns=std_cols, dtype=float)
 for dt in yields_df.index:
     row = yields_df.loc[dt]
@@ -371,18 +361,14 @@ if inds[0].size > 0:
     pca_vals[inds] = np.take(col_means, inds[1])
 pca_df_filled = pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
 
-# ==========================
 # PCA
-# ==========================
 scaler = StandardScaler(with_std=False)
 X = scaler.fit_transform(pca_df_filled.values.astype(float))
 n_comp = int(min(int(n_components), X.shape[1]))
 pca = PCA(n_components=n_comp)
 PCs = pca.fit_transform(X)
 
-# ==========================
 # PCA outputs
-# ==========================
 st.subheader("PCA Explained Variance")
 ev = pd.Series(
     pca.explained_variance_ratio_, index=[f"PC{i+1}" for i in range(len(pca.explained_variance_ratio_))]
@@ -407,9 +393,9 @@ sns.heatmap(
 )
 st.pyplot(fig)
 
-# ==========================
+
 # Curve reconstruction (single date)
-# ==========================
+
 st.subheader("Original vs PCA Reconstructed Curve")
 if pca_df_filled.index.size == 0:
     st.warning("No PCA output to reconstruct from.")
@@ -673,3 +659,4 @@ try:
     st.download_button("Download Residuals CSV", residuals.to_csv().encode(), "residuals.csv")
 except Exception:
     st.error("Could not prepare residuals CSV.")
+

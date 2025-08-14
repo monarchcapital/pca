@@ -1,4 +1,4 @@
-# appv1.py - Full fixed version (heatmap now shows values)
+# appv1.py - Full fixed version (heatmap shows values) — UPDATED default maturities
 import io
 import numpy as np
 import pandas as pd
@@ -135,7 +135,12 @@ yield_file = st.sidebar.file_uploader("Yield data CSV (dates + contract columns)
 expiry_file = st.sidebar.file_uploader("Expiry mapping CSV (maturity, date)", type="csv")
 holiday_file = st.sidebar.file_uploader("Holiday dates CSV (optional)", type="csv")
 
-std_maturities_txt = st.sidebar.text_input("Standard maturities (years, comma-separated):", "0.25,0.5,1,2,3,4,5")
+# UPDATED default maturities to: 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00, 4.00, 5.00, 7.00
+std_maturities_txt = st.sidebar.text_input(
+    "Standard maturities (years, comma-separated):",
+    "0.25,0.50,0.75,1.00,1.25,1.50,1.75,2.00,2.25,2.50,2.75,3.00,4.00,5.00,7.00",
+)
+
 interpolation_method = st.sidebar.selectbox("Interpolation method:", ["linear", "cubic", "quadratic", "nearest"])
 apply_smoothing = st.sidebar.checkbox("Apply smoothing (3-day centered)", value=False)
 use_geometric = st.sidebar.checkbox("Use geometric average (where applicable)", value=False)
@@ -152,6 +157,7 @@ if not yield_file or not expiry_file:
     st.stop()
 
 # ---------------- Load & parse ----------------
+
 def load_csv_file(f):
     return pd.read_csv(io.StringIO(f.getvalue().decode("utf-8")))
 
@@ -224,7 +230,7 @@ try:
     std_arr = np.array(sorted(std_maturities), dtype=float)
     std_cols = [f"{m:.2f}Y" for m in std_arr]
 except Exception:
-    st.error("Error parsing standard maturities. Use comma-separated numbers like: 0.25,0.5,1,2")
+    st.error("Error parsing standard maturities. Use comma-separated numbers like: 0.25,0.50,0.75,1, ...")
     st.stop()
 
 # ---------------- Build PCA interpolation matrix ----------------

@@ -15,38 +15,6 @@ st.set_page_config(layout="wide", page_title="Brazil DI Futures PCA - Fixed Heat
 
 # ---------------- Helpers ----------------
 QUARTERLY_CODES = {"F": 1, "J": 4, "N": 7, "V": 10}
-st.sidebar.header("Upload / Settings")
-
-# Group file uploads together to avoid duplicate element IDs
-yield_file = st.sidebar.file_uploader("1. Yield data CSV (dates + contract columns)", type="csv", key="yield_file")
-expiry_file = st.sidebar.file_uploader("2. Expiry mapping CSV (maturity, date)", type="csv", key="expiry_file")
-holiday_file = st.sidebar.file_uploader("3. Holiday dates CSV (optional)", type="csv", key="holiday_file")
-
-std_maturities_txt = st.sidebar.text_input(
-    "4. Standard maturities (years, comma-separated):",
-    "0.25,0.50,0.75,1.00,1.25,1.50,1.75,2.00,2.25,2.50,2.75,3.00,4.00,5.00,7.00",
-    key="maturities_txt"
-)
-interpolation_method = st.sidebar.selectbox("5. Interpolation method:", ["linear", "cubic", "quadratic", "nearest"], key="interp_method")
-apply_smoothing = st.sidebar.checkbox("6. Apply smoothing (3-day centered)", value=False, key="apply_smoothing")
-use_geometric = st.sidebar.checkbox("7. Use geometric average (where applicable)", value=False, key="use_geometric")
-n_components = st.sidebar.slider("8. Number of PCA components:", 1, 10, 3, key="n_components")
-rate_unit = st.sidebar.selectbox("9. Input rate unit:", ["Percent (e.g. 13.45)", "Decimal (e.g. 0.1345)", "Basis points (e.g. 1345)"], key="rate_unit")
-year_basis = int(st.sidebar.selectbox("10. Business days in year:", [252, 360], index=0, key="year_basis"))
-generics_method = st.sidebar.radio("11. Generics selection method:", ["Roll-window (BDs before expiry)", "Calendar quarter mapping"], key="generics_method")
-roll_bd_before = st.sidebar.number_input("12. Roll-window: business days before expiry", min_value=1, max_value=15, value=5, step=1, key="roll_bd_before")
-
-# Start Analysis button appears after all required inputs are provided
-if yield_file and expiry_file and std_maturities_txt:
-    if st.sidebar.button("Start Analysis", key="start_analysis"):
-        pass  # Proceed with the rest of the app logic
-    else:
-        st.info("Adjust parameters and click 'Start Analysis' to run.")
-        st.stop()
-else:
-    st.info("Please upload all required files and set parameters.")
-    st.stop()
-
 def safe_to_datetime(s):
     return pd.to_datetime(s, errors="coerce", dayfirst=True)
 

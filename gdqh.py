@@ -133,209 +133,216 @@ rate_unit = st.sidebar.selectbox("Input rate unit", ["Percent (e.g. 13.45)", "De
 year_basis = int(st.sidebar.selectbox("Business days in year", [252, 360], index=0))
 interp_method = "linear" # Hardcoded for consistency in backtest
 
-# --- Run Button ---
+# --- Initialize session state ---
+if 'results_df' not in st.session_state:
+    st.session_state.results_df = None
+
+# --- Run/Reset Buttons ---
 st.sidebar.markdown("---")
-if st.sidebar.button("Run Backtest"):
-    st.session_state.run_backtest = True
+col1, col2 = st.sidebar.columns(2)
+if col1.button("Run Backtest"):
+    st.session_state.results_df = None # Clear previous results before a new run
+    run_backtest = True
 else:
-    st.session_state.run_backtest = False
+    run_backtest = False
 
-if not st.session_state.run_backtest:
-    st.info("Upload files, configure the backtest parameters, and click **Run Backtest**.")
-    st.stop()
-if not all([yield_file, expiry_file]):
-    st.error("Please upload both Yield and Expiry data files.")
-    st.stop()
-if backtest_start_date >= backtest_end_date:
-    st.error("Backtest Start Date must be before the End Date.")
-    st.stop()
+if col2.button("Reset"):
+    st.session_state.results_df = None
+    st.rerun()
 
 # --------------------------
-# Data Loading
+# Main Logic
 # --------------------------
-@st.cache_data
-def load_all_data(yield_file, expiry_file, holiday_file):
-    # Yields
-    yields_df = pd.read_csv(io.StringIO(yield_file.getvalue().decode("utf-8")))
-    date_col = yields_df.columns[0]
-    yields_df[date_col] = safe_to_datetime(yields_df[date_col])
-    yields_df = yields_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
-    yields_df.columns = [str(c).strip() for c in yields_df.columns]
-    for c in yields_df.columns:
-        yields_df[c] = pd.to_numeric(yields_df[c], errors="coerce")
-    
-    # Expiry
-    expiry_raw = pd.read_csv(io.StringIO(expiry_file.getvalue().decode("utf-8")))
-    expiry_df = expiry_raw.iloc[:, :2].copy()
-    expiry_df.columns = ["MATURITY", "DATE"]
-    expiry_df["MATURITY"] = expiry_df["MATURITY"].astype(str).str.strip().str.upper()
-    expiry_df["DATE"] = safe_to_datetime(expiry_df["DATE"])
-    expiry_df = expiry_df.dropna(subset=["DATE"]).set_index("MATURITY")
 
-    # Holidays
-    holidays_np = np.array([], dtype="datetime64[D]")
-    if holiday_file:
-        hol_df = pd.read_csv(io.StringIO(holiday_file.getvalue().decode("utf-8")))
-        hol_series = safe_to_datetime(hol_df.iloc[:, 0]).dropna()
-        if not hol_series.empty:
-            holidays_np = np.array(hol_series.dt.date, dtype="datetime64[D]")
-            
-    return yields_df, expiry_df, holidays_np
+# Only run the backtest if the button was clicked AND results are not already computed
+if run_backtest and st.session_state.results_df is None:
+    if not all([yield_file, expiry_file]):
+        st.error("Please upload both Yield and Expiry data files.")
+        st.stop()
+    if backtest_start_date >= backtest_end_date:
+        st.error("Backtest Start Date must be before the End Date.")
+        st.stop()
 
-yields_df, expiry_df, holidays_np = load_all_data(yield_file, expiry_file, holiday_file)
-
-# --------------------------
-# BACKTESTING LOOP
-# --------------------------
-st.title("Backtest Results")
-
-# Prepare date ranges
-backtest_range = pd.bdate_range(start=backtest_start_date, end=backtest_end_date)
-all_available_dates = yields_df.index
-results = []
-
-# Setup grid
-std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
-std_cols = [f"{m:.2f}Y" for m in std_arr]
-
-progress_bar = st.progress(0)
-status_text = st.empty()
-
-for i, current_date in enumerate(backtest_range):
-    if current_date not in all_available_dates:
-        continue # Skip if it's a weekend/holiday not in our data
-
-    # 1. Define the training window for this iteration
-    training_end_date = current_date - pd.Timedelta(days=1)
-    training_start_date = training_end_date - pd.DateOffset(days=training_window_days * 1.5) # Approx to get enough business days
-    
-    train_mask = (yields_df.index >= training_start_date) & (yields_df.index <= training_end_date)
-    yields_df_train = yields_df.loc[train_mask].sort_index().tail(training_window_days)
-
-    if len(yields_df_train) < training_window_days / 2:
-        status_text.warning(f"Skipping {current_date.date()}: Not enough training data ({len(yields_df_train)} days).")
-        continue
-
-    # 2. Run PCA on the training window data
-    # Build standardized matrix
-    pca_df = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
-    for dt in yields_df_train.index:
-        pca_df.loc[dt] = row_to_std_grid(dt, yields_df_train.loc[dt], yields_df_train.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
-    
-    # Fill NaNs and run PCA
-    pca_vals = pca_df.values
-    col_means = np.nanmean(pca_vals, axis=0)
-    inds = np.where(np.isnan(pca_vals))
-    pca_vals[inds] = np.take(col_means, inds[1])
-    pca_df_filled = pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
-
-    scaler = StandardScaler(with_std=False)
-    X = scaler.fit_transform(pca_df_filled.values.astype(float))
-    pca = PCA(n_components=n_components_sel)
-    PCs = pca.fit_transform(X)
-    pc_cols = [f"PC{i+1}" for i in range(n_components_sel)]
-    PCs_df = pd.DataFrame(PCs, index=pca_df_filled.index, columns=pc_cols)
-
-    # 3. Generate Forecast
-    if forecast_model_type == "PCA Fair Value":
-        # The forecast is the smooth, reconstructed curve of the last day in the training window.
-        last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
-        reconstructed_centered = pca.inverse_transform(last_pcs)
-        pred_curve_std = scaler.inverse_transform(reconstructed_centered).flatten()
-    else:
-        if forecast_model_type == "VAR (Vector Autoregression)":
-            pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
-        else: # ARIMA
-            pcs_next = forecast_pcs_arima(PCs_df)
-
-        # Apply the predicted CHANGE to the last known actual curve
-        last_actual_curve_on_std = pca_df_filled.iloc[-1].values
-        last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
-        delta_pcs = pcs_next - last_pcs
-        delta_curve = pca.inverse_transform(delta_pcs)
-        pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
-
-    # 4. Get the actual curve for the day and store results
-    actual_series = yields_df.loc[current_date]
-    actual_curve_std = row_to_std_grid(current_date, actual_series, yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
-
-    results.append({
-        "Date": current_date,
-        "Predicted_Curve": pred_curve_std,
-        "Actual_Curve": actual_curve_std
-    })
-
-    # Update progress
-    progress_bar.progress((i + 1) / len(backtest_range))
-    status_text.text(f"Processing: {current_date.date()}...")
-
-status_text.success("Backtest complete!")
-progress_bar.empty()
-
-# --------------------------
-# RESULTS ANALYSIS
-# --------------------------
-if not results:
-    st.error("No results were generated. This might be because the backtest date range has no valid data points. Please check your data and date selections.")
-    st.stop()
-
-results_df = pd.DataFrame(results)
-# --- FIX: Drop rows where the actual curve could not be constructed ---
-mask = results_df['Actual_Curve'].apply(lambda x: np.isnan(x).all())
-results_df = results_df[~mask].copy()
-
-if results_df.empty:
-    st.error("No valid results to analyze after cleaning. The model may have failed to generate valid curves for the selected backtest period.")
-    st.stop()
-
-# Calculate daily errors for the entire curve
-errors = results_df.apply(lambda row: row['Predicted_Curve'] - row['Actual_Curve'], axis=1)
-results_df['Daily_RMSE'] = errors.apply(lambda x: np.sqrt(np.mean(x**2)))
-results_df['Daily_MAE'] = errors.apply(lambda x: np.mean(np.abs(x)))
-
-st.header("Overall Curve Performance Metrics")
-overall_rmse = results_df['Daily_RMSE'].mean()
-overall_mae = results_df['Daily_MAE'].mean()
-
-col1, col2 = st.columns(2)
-col1.metric("Average Daily Curve RMSE", f"{overall_rmse:.4f}")
-col2.metric("Average Daily Curve MAE", f"{overall_mae:.4f}")
-
-st.markdown("---")
-st.header("Daily Curve Performance Visualization")
-st.write("Select a date from the backtest to visually inspect the model's forecast against the actual yield curve.")
-
-# Use a slider for selecting the date
-unique_dates = results_df['Date'].dt.date.unique()
-selected_date = st.select_slider(
-    "Select a date to inspect",
-    options=unique_dates,
-    value=unique_dates[-1] if len(unique_dates) > 0 else None
-)
-
-if selected_date:
-    plot_data = results_df[results_df['Date'].dt.date == selected_date]
-
-    if not plot_data.empty:
-        actual_c = plot_data['Actual_Curve'].iloc[0]
-        pred_c = plot_data['Predicted_Curve'].iloc[0]
-
-        fig, ax = plt.subplots(figsize=(14, 7))
-        ax.plot(std_arr, actual_c, label=f"Actual on {selected_date}", color='royalblue', marker='o', linestyle='-')
-        ax.plot(std_arr, pred_c, label=f"Predicted for {selected_date}", color='darkorange', marker='x', linestyle='--')
+    # --------------------------
+    # Data Loading
+    # --------------------------
+    @st.cache_data
+    def load_all_data(yield_file, expiry_file, holiday_file):
+        # Yields
+        yields_df = pd.read_csv(io.StringIO(yield_file.getvalue().decode("utf-8")))
+        date_col = yields_df.columns[0]
+        yields_df[date_col] = safe_to_datetime(yields_df[date_col])
+        yields_df = yields_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+        yields_df.columns = [str(c).strip() for c in yields_df.columns]
+        for c in yields_df.columns:
+            yields_df[c] = pd.to_numeric(yields_df[c], errors="coerce")
         
-        ax.set_title(f"Yield Curve Forecast vs. Actual for {selected_date}", fontsize=16)
-        ax.set_xlabel("Standardized Maturity (Years)")
-        ax.set_ylabel(f"Rate ({rate_unit})")
-        ax.set_xticks(std_arr)
-        ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45, ha="right")
-        ax.legend()
-        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-        plt.tight_layout()
-        st.pyplot(fig)
+        # Expiry
+        expiry_raw = pd.read_csv(io.StringIO(expiry_file.getvalue().decode("utf-8")))
+        expiry_df = expiry_raw.iloc[:, :2].copy()
+        expiry_df.columns = ["MATURITY", "DATE"]
+        expiry_df["MATURITY"] = expiry_df["MATURITY"].astype(str).str.strip().str.upper()
+        expiry_df["DATE"] = safe_to_datetime(expiry_df["DATE"])
+        expiry_df = expiry_df.dropna(subset=["DATE"]).set_index("MATURITY")
 
-st.markdown("---")
-st.subheader("Raw Curve Data")
-st.write("This table contains the raw predicted and actual curve vectors for each day of the backtest.")
-st.dataframe(results_df)
+        # Holidays
+        holidays_np = np.array([], dtype="datetime64[D]")
+        if holiday_file:
+            hol_df = pd.read_csv(io.StringIO(holiday_file.getvalue().decode("utf-8")))
+            hol_series = safe_to_datetime(hol_df.iloc[:, 0]).dropna()
+            if not hol_series.empty:
+                holidays_np = np.array(hol_series.dt.date, dtype="datetime64[D]")
+                
+        return yields_df, expiry_df, holidays_np
+
+    yields_df, expiry_df, holidays_np = load_all_data(yield_file, expiry_file, holiday_file)
+
+    # --------------------------
+    # BACKTESTING LOOP
+    # --------------------------
+    st.title("Backtest Results")
+    results = []
+    
+    # Prepare date ranges
+    backtest_range = pd.bdate_range(start=backtest_start_date, end=backtest_end_date)
+    all_available_dates = yields_df.index
+
+    # Setup grid
+    std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
+    std_cols = [f"{m:.2f}Y" for m in std_arr]
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, current_date in enumerate(backtest_range):
+        if current_date not in all_available_dates:
+            continue
+
+        training_end_date = current_date - pd.Timedelta(days=1)
+        training_start_date = training_end_date - pd.DateOffset(days=training_window_days * 1.5)
+        
+        train_mask = (yields_df.index >= training_start_date) & (yields_df.index <= training_end_date)
+        yields_df_train = yields_df.loc[train_mask].sort_index().tail(training_window_days)
+
+        if len(yields_df_train) < training_window_days / 2:
+            continue
+
+        pca_df = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
+        for dt in yields_df_train.index:
+            pca_df.loc[dt] = row_to_std_grid(dt, yields_df_train.loc[dt], yields_df_train.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        
+        pca_vals = pca_df.values
+        col_means = np.nanmean(pca_vals, axis=0)
+        inds = np.where(np.isnan(pca_vals))
+        pca_vals[inds] = np.take(col_means, inds[1])
+        pca_df_filled = pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
+
+        scaler = StandardScaler(with_std=False)
+        X = scaler.fit_transform(pca_df_filled.values.astype(float))
+        pca = PCA(n_components=n_components_sel)
+        PCs = pca.fit_transform(X)
+        pc_cols = [f"PC{i+1}" for i in range(n_components_sel)]
+        PCs_df = pd.DataFrame(PCs, index=pca_df_filled.index, columns=pc_cols)
+
+        if forecast_model_type == "PCA Fair Value":
+            last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
+            reconstructed_centered = pca.inverse_transform(last_pcs)
+            pred_curve_std = scaler.inverse_transform(reconstructed_centered).flatten()
+        else:
+            if forecast_model_type == "VAR (Vector Autoregression)":
+                pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
+            else: # ARIMA
+                pcs_next = forecast_pcs_arima(PCs_df)
+            
+            last_actual_curve_on_std = pca_df_filled.iloc[-1].values
+            last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
+            delta_pcs = pcs_next - last_pcs
+            delta_curve = pca.inverse_transform(delta_pcs)
+            pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
+
+        actual_series = yields_df.loc[current_date]
+        actual_curve_std = row_to_std_grid(current_date, actual_series, yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+
+        results.append({
+            "Date": current_date,
+            "Predicted_Curve": pred_curve_std,
+            "Actual_Curve": actual_curve_std
+        })
+
+        progress_bar.progress((i + 1) / len(backtest_range))
+        status_text.text(f"Processing: {current_date.date()}...")
+
+    status_text.success("Backtest complete!")
+    progress_bar.empty()
+    
+    if results:
+        st.session_state.results_df = pd.DataFrame(results)
+
+# --------------------------
+# RESULTS ANALYSIS (runs if results are in state)
+# --------------------------
+if st.session_state.results_df is not None:
+    results_df = st.session_state.results_df
+    st.title("Backtest Results")
+    
+    mask = results_df['Actual_Curve'].apply(lambda x: isinstance(x, float) or np.isnan(x).all())
+    results_df = results_df[~mask].copy()
+
+    if results_df.empty:
+        st.error("No valid results to analyze after cleaning. The model may have failed to generate valid curves for the selected backtest period.")
+        st.stop()
+
+    errors = results_df.apply(lambda row: row['Predicted_Curve'] - row['Actual_Curve'], axis=1)
+    results_df['Daily_RMSE'] = errors.apply(lambda x: np.sqrt(np.mean(x**2)))
+    results_df['Daily_MAE'] = errors.apply(lambda x: np.mean(np.abs(x)))
+
+    st.header("Overall Curve Performance Metrics")
+    overall_rmse = results_df['Daily_RMSE'].mean()
+    overall_mae = results_df['Daily_MAE'].mean()
+
+    col1, col2 = st.columns(2)
+    col1.metric("Average Daily Curve RMSE", f"{overall_rmse:.4f}")
+    col2.metric("Average Daily Curve MAE", f"{overall_mae:.4f}")
+
+    st.markdown("---")
+    st.header("Daily Curve Performance Visualization")
+    st.write("Select a date from the backtest to visually inspect the model's forecast against the actual yield curve.")
+
+    unique_dates = results_df['Date'].dt.date.unique()
+    # Setup grid
+    std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
+    
+    selected_date = st.select_slider(
+        "Select a date to inspect",
+        options=unique_dates,
+        value=unique_dates[-1] if len(unique_dates) > 0 else None
+    )
+
+    if selected_date:
+        plot_data = results_df[results_df['Date'].dt.date == selected_date]
+
+        if not plot_data.empty:
+            actual_c = plot_data['Actual_Curve'].iloc[0]
+            pred_c = plot_data['Predicted_Curve'].iloc[0]
+
+            fig, ax = plt.subplots(figsize=(14, 7))
+            ax.plot(std_arr, actual_c, label=f"Actual on {selected_date}", color='royalblue', marker='o', linestyle='-')
+            ax.plot(std_arr, pred_c, label=f"Predicted for {selected_date}", color='darkorange', marker='x', linestyle='--')
+            
+            ax.set_title(f"Yield Curve Forecast vs. Actual for {selected_date}", fontsize=16)
+            ax.set_xlabel("Standardized Maturity (Years)")
+            ax.set_ylabel(f"Rate ({rate_unit})")
+            ax.set_xticks(std_arr)
+            ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45, ha="right")
+            ax.legend()
+            ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+            plt.tight_layout()
+            st.pyplot(fig)
+
+    st.markdown("---")
+    st.subheader("Raw Curve Data")
+    st.write("This table contains the raw predicted and actual curve vectors for each day of the backtest.")
+    st.dataframe(results_df)
+else:
+    st.info("Upload files, configure the backtest parameters, and click **Run Backtest**.")
 

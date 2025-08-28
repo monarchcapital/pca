@@ -140,7 +140,7 @@ training_window_days = st.sidebar.number_input("Rolling Training Window (busines
 
 st.sidebar.header("3) Model Parameters")
 n_components_sel = st.sidebar.slider("Number of PCA components", 1, 10, 3)
-forecast_model_type = st.sidebar.selectbox("Forecasting Model to Test", ["VAR (Vector Autoregression)", "ARIMA (per Component)"])
+forecast_model_type = st.sidebar.selectbox("Forecasting Model to Test", ["PCA Fair Value", "VAR (Vector Autoregression)", "ARIMA (per Component)"])
 var_lags = 1
 if forecast_model_type == "VAR (Vector Autoregression)":
     var_lags = st.sidebar.number_input("VAR model lags", min_value=1, max_value=20, value=1, step=1)
@@ -253,16 +253,23 @@ for i, current_date in enumerate(backtest_range):
     PCs_df = pd.DataFrame(PCs, index=pca_df_filled.index, columns=pc_cols)
 
     # 3. Generate Forecast
-    if forecast_model_type == "VAR (Vector Autoregression)":
-        pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
-    else: # ARIMA
-        pcs_next = forecast_pcs_arima(PCs_df)
+    if forecast_model_type == "PCA Fair Value":
+        # The forecast is the smooth, reconstructed curve of the last day in the training window.
+        last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
+        reconstructed_centered = pca.inverse_transform(last_pcs)
+        pred_curve_std = scaler.inverse_transform(reconstructed_centered).flatten()
+    else:
+        if forecast_model_type == "VAR (Vector Autoregression)":
+            pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
+        else: # ARIMA
+            pcs_next = forecast_pcs_arima(PCs_df)
 
-    last_actual_curve_on_std = pca_df_filled.iloc[-1].values
-    last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
-    delta_pcs = pcs_next - last_pcs
-    delta_curve = pca.inverse_transform(delta_pcs)
-    pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
+        # Apply the predicted CHANGE to the last known actual curve
+        last_actual_curve_on_std = pca_df_filled.iloc[-1].values
+        last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
+        delta_pcs = pcs_next - last_pcs
+        delta_curve = pca.inverse_transform(delta_pcs)
+        pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
 
     # 4. Convert forecast back to contracts and store results
     pred_contracts = std_grid_to_contracts(current_date, pred_curve_std, std_arr, expiry_df, yields_df.columns, holidays_np, year_basis, rate_unit, interp_method)

@@ -300,6 +300,9 @@ if not results:
     st.stop()
 
 results_df = pd.DataFrame(results)
+# --- FIX: Drop rows with NaN values before calculations to prevent errors ---
+results_df.dropna(inplace=True)
+
 results_df['Error'] = results_df['Predicted'] - results_df['Actual']
 results_df['Abs_Error'] = np.abs(results_df['Error'])
 

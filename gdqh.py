@@ -120,7 +120,7 @@ holiday_file = st.sidebar.file_uploader("Holiday dates CSV (optional)", type="cs
 st.sidebar.header("2) Configure Backtest")
 backtest_start_date = st.sidebar.date_input("Backtest Start Date")
 backtest_end_date = st.sidebar.date_input("Backtest End Date")
-training_window_days = st.sidebar.number_input("Rolling Training Window (business days)", min_value=50, max_value=1000, value=252, step=1)
+training_window_days = st.sidebar.number_input("Rolling Training Window (business days)", min_value=1, max_value=1000, value=252, step=1)
 
 st.sidebar.header("3) Model Parameters")
 n_components_sel = st.sidebar.slider("Number of PCA components", 1, 10, 3)
@@ -312,10 +312,10 @@ if st.session_state.results_df is not None:
     # Setup grid
     std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
     
-    selected_date = st.select_slider(
+    selected_date = st.selectbox(
         "Select a date to inspect",
         options=unique_dates,
-        value=unique_dates[-1] if len(unique_dates) > 0 else None
+        index=len(unique_dates) - 1 if len(unique_dates) > 0 else 0
     )
 
     if selected_date:

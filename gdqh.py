@@ -9,8 +9,9 @@
 # 2. It iterates day-by-day through this period.
 # 3. On each day, it uses a "rolling window" of past data (e.g., the last 252 days)
 #    to train the PCA model and the selected forecasting model (VAR, ARIMA, etc.).
-# 4. It makes a one-day-ahead forecast and compares it to the actual market outcome.
-# 5. After the loop, it aggregates all results and calculates performance metrics.
+# 4. It makes a one-day-ahead forecast of the ENTIRE YIELD CURVE and compares it
+#    to the actual market outcome.
+# 5. After the loop, it aggregates daily curve errors to calculate performance metrics.
 #
 # ---------------------------------------------------------------------------------
 
@@ -93,23 +94,6 @@ def row_to_std_grid(dt, row_series, available_contracts, expiry_df, std_arr, hol
             return f(std_arr)
         except Exception: return np.full_like(std_arr, np.nan, dtype=float)
     return np.full_like(std_arr, np.nan, dtype=float)
-
-def std_grid_to_contracts(dt, std_curve_rates, std_arr, expiry_df, all_contracts, holidays_np, year_basis, rate_unit, interp_method):
-    contract_rates = pd.Series(index=all_contracts, dtype=float)
-    interp_func = interp1d(std_arr, std_curve_rates, kind=interp_method, bounds_error=False, fill_value='extrapolate')
-    for contract in all_contracts:
-        mat_up = str(contract).strip().upper()
-        if mat_up not in expiry_df.index: continue
-        exp = expiry_df.loc[mat_up, "DATE"]
-        if pd.isna(exp) or pd.Timestamp(exp).date() < dt.date(): continue
-        t = calculate_ttm(dt, exp, holidays_np, year_basis)
-        if np.isnan(t) or t <= 0: continue
-        zero_percent = interp_func(t)
-        rate_frac = zero_percent / 100.0
-        if "Percent" in rate_unit: contract_rates[contract] = rate_frac * 100.0
-        elif "Basis" in rate_unit: contract_rates[contract] = rate_frac * 10000.0
-        else: contract_rates[contract] = rate_frac
-    return contract_rates.dropna()
 
 def forecast_pcs_var(PCs_df, lags=1):
     if len(PCs_df) < lags + 5: return PCs_df.iloc[-1:].values
@@ -271,19 +255,15 @@ for i, current_date in enumerate(backtest_range):
         delta_curve = pca.inverse_transform(delta_pcs)
         pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
 
-    # 4. Convert forecast back to contracts and store results
-    pred_contracts = std_grid_to_contracts(current_date, pred_curve_std, std_arr, expiry_df, yields_df.columns, holidays_np, year_basis, rate_unit, interp_method)
-    actual_contracts = yields_df.loc[current_date]
+    # 4. Get the actual curve for the day and store results
+    actual_series = yields_df.loc[current_date]
+    actual_curve_std = row_to_std_grid(current_date, actual_series, yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
 
-    # Align and store
-    common_contracts = pred_contracts.index.intersection(actual_contracts.index)
-    for contract in common_contracts:
-        results.append({
-            "Date": current_date,
-            "Contract": contract,
-            "Predicted": pred_contracts[contract],
-            "Actual": actual_contracts[contract]
-        })
+    results.append({
+        "Date": current_date,
+        "Predicted_Curve": pred_curve_std,
+        "Actual_Curve": actual_curve_std
+    })
 
     # Update progress
     progress_bar.progress((i + 1) / len(backtest_range))
@@ -300,58 +280,62 @@ if not results:
     st.stop()
 
 results_df = pd.DataFrame(results)
-# --- FIX: Drop rows with NaN values before calculations to prevent errors ---
-results_df.dropna(inplace=True)
+# --- FIX: Drop rows where the actual curve could not be constructed ---
+mask = results_df['Actual_Curve'].apply(lambda x: np.isnan(x).all())
+results_df = results_df[~mask].copy()
 
-results_df['Error'] = results_df['Predicted'] - results_df['Actual']
-results_df['Abs_Error'] = np.abs(results_df['Error'])
+if results_df.empty:
+    st.error("No valid results to analyze after cleaning. The model may have failed to generate valid curves for the selected backtest period.")
+    st.stop()
 
-st.header("Overall Performance Metrics")
-rmse = np.sqrt(mean_squared_error(results_df['Actual'], results_df['Predicted']))
-mae = mean_absolute_error(results_df['Actual'], results_df['Predicted'])
+# Calculate daily errors for the entire curve
+errors = results_df.apply(lambda row: row['Predicted_Curve'] - row['Actual_Curve'], axis=1)
+results_df['Daily_RMSE'] = errors.apply(lambda x: np.sqrt(np.mean(x**2)))
+results_df['Daily_MAE'] = errors.apply(lambda x: np.mean(np.abs(x)))
 
-# Directional Accuracy
-results_df['Actual_Change'] = results_df.groupby('Contract')['Actual'].diff()
-results_df['Predicted_Change'] = results_df.groupby('Contract')['Predicted'].diff()
-results_df['Correct_Direction'] = (np.sign(results_df['Actual_Change']) == np.sign(results_df['Predicted_Change']))
-directional_accuracy = results_df['Correct_Direction'].mean() * 100
+st.header("Overall Curve Performance Metrics")
+overall_rmse = results_df['Daily_RMSE'].mean()
+overall_mae = results_df['Daily_MAE'].mean()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Root Mean Squared Error (RMSE)", f"{rmse:.4f}")
-col2.metric("Mean Absolute Error (MAE)", f"{mae:.4f}")
-col3.metric("Directional Accuracy", f"{directional_accuracy:.2f}%")
+col1, col2 = st.columns(2)
+col1.metric("Average Daily Curve RMSE", f"{overall_rmse:.4f}")
+col2.metric("Average Daily Curve MAE", f"{overall_mae:.4f}")
 
 st.markdown("---")
-st.header("Performance by Contract")
+st.header("Daily Curve Performance Visualization")
+st.write("Select a date from the backtest to visually inspect the model's forecast against the actual yield curve.")
 
-# --- Error Analysis by Contract ---
-error_by_contract = results_df.groupby('Contract').agg(
-    MAE=('Abs_Error', 'mean'),
-    RMSE=('Error', lambda x: np.sqrt(np.mean(x**2)))
-).sort_values('MAE', ascending=False)
+# Use a slider for selecting the date
+unique_dates = results_df['Date'].dt.date.unique()
+selected_date = st.select_slider(
+    "Select a date to inspect",
+    options=unique_dates,
+    value=unique_dates[-1] if len(unique_dates) > 0 else None
+)
 
-st.subheader("Average Error by Contract")
-st.dataframe(error_by_contract.style.format("{:.4f}"))
+if selected_date:
+    plot_data = results_df[results_df['Date'].dt.date == selected_date]
 
-# --- Visualization ---
+    if not plot_data.empty:
+        actual_c = plot_data['Actual_Curve'].iloc[0]
+        pred_c = plot_data['Predicted_Curve'].iloc[0]
+
+        fig, ax = plt.subplots(figsize=(14, 7))
+        ax.plot(std_arr, actual_c, label=f"Actual on {selected_date}", color='royalblue', marker='o', linestyle='-')
+        ax.plot(std_arr, pred_c, label=f"Predicted for {selected_date}", color='darkorange', marker='x', linestyle='--')
+        
+        ax.set_title(f"Yield Curve Forecast vs. Actual for {selected_date}", fontsize=16)
+        ax.set_xlabel("Standardized Maturity (Years)")
+        ax.set_ylabel(f"Rate ({rate_unit})")
+        ax.set_xticks(std_arr)
+        ax.set_xticklabels([f"{m:.2f}Y" for m in std_arr], rotation=45, ha="right")
+        ax.legend()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.tight_layout()
+        st.pyplot(fig)
+
 st.markdown("---")
-st.header("Predicted vs. Actual Visualization")
-contracts_to_plot = results_df['Contract'].unique()
-selected_contract = st.selectbox("Select a contract to visualize", options=contracts_to_plot)
-
-plot_df = results_df[results_df['Contract'] == selected_contract].set_index('Date')
-
-fig, ax = plt.subplots(figsize=(14, 7))
-ax.plot(plot_df.index, plot_df['Actual'], label='Actual', color='royalblue', marker='.', linestyle='-')
-ax.plot(plot_df.index, plot_df['Predicted'], label='Predicted', color='darkorange', marker='.', linestyle='--')
-ax.set_title(f"Predicted vs. Actual Rates for {selected_contract}", fontsize=16)
-ax.set_xlabel("Date")
-ax.set_ylabel(f"Rate ({rate_unit})")
-ax.legend()
-ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-plt.tight_layout()
-st.pyplot(fig)
-
-st.subheader("Raw Results Data")
+st.subheader("Raw Curve Data")
+st.write("This table contains the raw predicted and actual curve vectors for each day of the backtest.")
 st.dataframe(results_df)
 

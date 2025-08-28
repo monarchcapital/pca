@@ -136,18 +136,22 @@ interp_method = "linear" # Hardcoded for consistency in backtest
 # --- Initialize session state ---
 if 'results_df' not in st.session_state:
     st.session_state.results_df = None
+if 'selected_date_index' not in st.session_state:
+    st.session_state.selected_date_index = 0
 
 # --- Run/Reset Buttons ---
 st.sidebar.markdown("---")
 col1, col2 = st.sidebar.columns(2)
 if col1.button("Run Backtest"):
     st.session_state.results_df = None # Clear previous results before a new run
+    st.session_state.selected_date_index = 0
     run_backtest = True
 else:
     run_backtest = False
 
 if col2.button("Reset"):
     st.session_state.results_df = None
+    st.session_state.selected_date_index = 0
     st.rerun()
 
 # --------------------------
@@ -312,11 +316,32 @@ if st.session_state.results_df is not None:
     # Setup grid
     std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
     
-    selected_date = st.selectbox(
+    # --- Date Navigation ---
+    prev_col, date_col, next_col = st.columns([1, 4, 1])
+
+    if prev_col.button("◀ Previous"):
+        if st.session_state.selected_date_index > 0:
+            st.session_state.selected_date_index -= 1
+
+    if next_col.button("Next ▶"):
+        if st.session_state.selected_date_index < len(unique_dates) - 1:
+            st.session_state.selected_date_index += 1
+    
+    # Ensure index is not out of bounds if results change
+    if st.session_state.selected_date_index >= len(unique_dates):
+        st.session_state.selected_date_index = len(unique_dates) - 1
+
+    selected_date = date_col.selectbox(
         "Select a date to inspect",
         options=unique_dates,
-        index=len(unique_dates) - 1 if len(unique_dates) > 0 else 0
+        index=st.session_state.selected_date_index,
+        key='date_selector'
     )
+    
+    # Update session state if selectbox is changed manually
+    # This ensures buttons and selectbox are always in sync
+    new_index = list(unique_dates).index(st.session_state.date_selector)
+    st.session_state.selected_date_index = new_index
 
     if selected_date:
         plot_data = results_df[results_df['Date'].dt.date == selected_date]

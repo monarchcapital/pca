@@ -95,6 +95,7 @@ def row_to_std_grid(dt, row_series, available_contracts, expiry_df, std_arr, hol
         except Exception: return np.full_like(std_arr, np.nan, dtype=float)
     return np.full_like(std_arr, np.nan, dtype=float)
 
+
 def forecast_pcs_var(PCs_df, lags=1):
     if len(PCs_df) < lags + 5: return PCs_df.iloc[-1:].values
     results = VAR(PCs_df).fit(lags)
@@ -108,6 +109,48 @@ def forecast_pcs_arima(PCs_df):
             continue
         forecasts.append(ARIMA(series, order=(1, 1, 0)).fit().forecast(steps=1).iloc[0])
     return np.array(forecasts).reshape(1, -1)
+
+
+def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method):
+    # Step 1: Create a DataFrame for zero rates on the standard grid
+    std_cols = [f"{m:.2f}Y" for m in std_arr]
+    pca_df_zeros = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
+    available_contracts = yields_df_train.columns
+    for dt in yields_df_train.index:
+        pca_df_zeros.loc[dt] = row_to_std_grid(
+            dt, yields_df_train.loc[dt], available_contracts, expiry_df,
+            std_arr, holidays_np, year_basis, rate_unit, interp_method
+        )
+
+    # Step 2: Calculate Spreads
+    spread_cols = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
+    pca_df_spreads = pd.DataFrame(np.nan, index=pca_df_zeros.index, columns=spread_cols, dtype=float)
+    for i in range(1, len(std_cols)):
+        col_name = f"{std_cols[i]}-{std_cols[i-1]}"
+        pca_df_spreads[col_name] = pca_df_zeros[std_cols[i]] - pca_df_zeros[std_cols[i-1]]
+
+    # Step 3: Calculate Butterflies
+    fly_cols = [f"{std_cols[i+1]}-{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols) - 1)]
+    pca_df_flies = pd.DataFrame(np.nan, index=pca_df_zeros.index, columns=fly_cols, dtype=float)
+    for i in range(1, len(std_cols) - 1):
+        col_name = f"{std_cols[i+1]}-{std_cols[i]}-{std_cols[i-1]}"
+        pca_df_flies[col_name] = (pca_df_zeros[std_cols[i+1]] - pca_df_zeros[std_cols[i]]) - (pca_df_zeros[std_cols[i]] - pca_df_zeros[std_cols[i-1]])
+
+    # Step 4: Combine all series into a single PCA matrix
+    pca_df_combined = pd.concat([pca_df_zeros, pca_df_spreads, pca_df_flies], axis=1)
+
+    # Fill NaN values with the column mean (after calculation)
+    pca_vals = pca_df_combined.values.astype(float)
+    col_means = np.nanmean(pca_vals, axis=0)
+    if np.isnan(col_means).any():
+        overall_mean = np.nanmean(col_means[~np.isnan(col_means)]) if np.any(~np.isnan(col_means)) else 0.0
+        col_means = np.where(np.isnan(col_means), overall_mean, col_means)
+    inds = np.where(np.isnan(pca_vals))
+    if inds[0].size > 0:
+        pca_vals[inds] = np.take(col_means, inds[1])
+
+    return pd.DataFrame(pca_vals, index=pca_df_combined.index, columns=pca_df_combined.columns)
+
 
 # --------------------------
 # Sidebar — Inputs
@@ -138,6 +181,8 @@ if 'results_df' not in st.session_state:
     st.session_state.results_df = None
 if 'selected_date_index' not in st.session_state:
     st.session_state.selected_date_index = 0
+if 'selected_spread_date_index' not in st.session_state:
+    st.session_state.selected_spread_date_index = 0
 
 # --- Run/Reset Buttons ---
 st.sidebar.markdown("---")
@@ -145,6 +190,7 @@ col1, col2 = st.sidebar.columns(2)
 if col1.button("Run Backtest"):
     st.session_state.results_df = None # Clear previous results before a new run
     st.session_state.selected_date_index = 0
+    st.session_state.selected_spread_date_index = 0
     run_backtest = True
 else:
     run_backtest = False
@@ -152,6 +198,7 @@ else:
 if col2.button("Reset"):
     st.session_state.results_df = None
     st.session_state.selected_date_index = 0
+    st.session_state.selected_spread_date_index = 0
     st.rerun()
 
 # --------------------------
@@ -231,46 +278,58 @@ if run_backtest and st.session_state.results_df is None:
         if len(yields_df_train) < training_window_days / 2:
             continue
 
-        pca_df = pd.DataFrame(np.nan, index=yields_df_train.index, columns=std_cols, dtype=float)
-        for dt in yields_df_train.index:
-            pca_df.loc[dt] = row_to_std_grid(dt, yields_df_train.loc[dt], yields_df_train.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        # Build the full PCA matrix (rates, spreads, flies)
+        pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
         
-        pca_vals = pca_df.values
-        col_means = np.nanmean(pca_vals, axis=0)
-        inds = np.where(np.isnan(pca_vals))
-        pca_vals[inds] = np.take(col_means, inds[1])
-        pca_df_filled = pd.DataFrame(pca_vals, index=pca_df.index, columns=pca_df.columns)
+        if pca_df_filled.empty: continue
 
         scaler = StandardScaler(with_std=False)
         X = scaler.fit_transform(pca_df_filled.values.astype(float))
-        pca = PCA(n_components=n_components_sel)
+        n_components_sel_capped = min(n_components_sel, X.shape[1])
+        pca = PCA(n_components=n_components_sel_capped)
         PCs = pca.fit_transform(X)
-        pc_cols = [f"PC{i+1}" for i in range(n_components_sel)]
+        pc_cols = [f"PC{i+1}" for i in range(n_components_sel_capped)]
         PCs_df = pd.DataFrame(PCs, index=pca_df_filled.index, columns=pc_cols)
 
         if forecast_model_type == "PCA Fair Value":
             last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
             reconstructed_centered = pca.inverse_transform(last_pcs)
-            pred_curve_std = scaler.inverse_transform(reconstructed_centered).flatten()
+            pred_full_curve = scaler.inverse_transform(reconstructed_centered).flatten()
         else:
             if forecast_model_type == "VAR (Vector Autoregression)":
                 pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
             else: # ARIMA
                 pcs_next = forecast_pcs_arima(PCs_df)
             
-            last_actual_curve_on_std = pca_df_filled.iloc[-1].values
+            last_actual_full_curve = pca_df_filled.iloc[-1].values
             last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
             delta_pcs = pcs_next - last_pcs
             delta_curve = pca.inverse_transform(delta_pcs)
-            pred_curve_std = last_actual_curve_on_std + delta_curve.flatten()
+            pred_full_curve = last_actual_full_curve + delta_curve.flatten()
 
-        actual_series = yields_df.loc[current_date]
-        actual_curve_std = row_to_std_grid(current_date, actual_series, yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        actual_series_on_grid = row_to_std_grid(current_date, yields_df.loc[current_date], yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        
+        # Build the actual full curve (rates, spreads, flies) for comparison
+        actual_df = pd.DataFrame([actual_series_on_grid], columns=std_cols, index=[current_date])
+        spread_cols = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
+        actual_df_spreads = pd.DataFrame(np.nan, index=actual_df.index, columns=spread_cols, dtype=float)
+        for j in range(1, len(std_cols)):
+            col_name = f"{std_cols[j]}-{std_cols[j-1]}"
+            actual_df_spreads[col_name] = actual_df[std_cols[j]] - actual_df[std_cols[j-1]]
+
+        fly_cols = [f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}" for j in range(1, len(std_cols) - 1)]
+        actual_df_flies = pd.DataFrame(np.nan, index=actual_df.index, columns=fly_cols, dtype=float)
+        for j in range(1, len(std_cols) - 1):
+            col_name = f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}"
+            actual_df_flies[col_name] = (actual_df[std_cols[j+1]] - actual_df[std_cols[j]]) - (actual_df[std_cols[j]] - actual_df[std_cols[j-1]])
+
+        actual_full_curve = pd.concat([actual_df, actual_df_spreads, actual_df_flies], axis=1).iloc[0].values
 
         results.append({
             "Date": current_date,
-            "Predicted_Curve": pred_curve_std,
-            "Actual_Curve": actual_curve_std
+            "Predicted_Curve": pred_full_curve,
+            "Actual_Curve": actual_full_curve,
+            "Column_Names": pca_df_filled.columns.tolist()
         })
 
         progress_bar.progress((i + 1) / len(backtest_range))
@@ -289,6 +348,7 @@ if st.session_state.results_df is not None:
     results_df = st.session_state.results_df
     st.title("Backtest Results")
     
+    # Filter out rows where the actual curve is all NaN
     mask = results_df['Actual_Curve'].apply(lambda x: isinstance(x, float) or np.isnan(x).all())
     results_df = results_df[~mask].copy()
 
@@ -296,38 +356,52 @@ if st.session_state.results_df is not None:
         st.error("No valid results to analyze after cleaning. The model may have failed to generate valid curves for the selected backtest period.")
         st.stop()
 
-    errors = results_df.apply(lambda row: row['Predicted_Curve'] - row['Actual_Curve'], axis=1)
-    results_df['Daily_RMSE'] = errors.apply(lambda x: np.sqrt(np.mean(x**2)))
-    results_df['Daily_MAE'] = errors.apply(lambda x: np.mean(np.abs(x)))
+    # Get the column names from the first valid row
+    all_cols = results_df.iloc[0]['Column_Names']
+    std_cols = [c for c in all_cols if '-' not in c]
+    spread_cols = [c for c in all_cols if '-' in c and len(c.split('-')) == 2]
+    fly_cols = [c for c in all_cols if '-' in c and len(c.split('-')) == 3]
 
-    st.header("Overall Curve Performance Metrics")
-    overall_rmse = results_df['Daily_RMSE'].mean()
-    overall_mae = results_df['Daily_MAE'].mean()
+    # Calculate errors for each component type
+    def calculate_errors(row, cols):
+        pred = row['Predicted_Curve'][np.isin(all_cols, cols)]
+        actual = row['Actual_Curve'][np.isin(all_cols, cols)]
+        if np.isnan(actual).all(): return np.nan
+        return pd.Series({
+            'RMSE': np.sqrt(np.mean((pred - actual)**2)),
+            'MAE': np.mean(np.abs(pred - actual))
+        })
+    
+    results_df[['Daily_RMSE_Rates', 'Daily_MAE_Rates']] = results_df.apply(lambda row: calculate_errors(row, std_cols), axis=1)
+    results_df[['Daily_RMSE_Spreads', 'Daily_MAE_Spreads']] = results_df.apply(lambda row: calculate_errors(row, spread_cols), axis=1)
+    results_df[['Daily_RMSE_Flies', 'Daily_MAE_Flies']] = results_df.apply(lambda row: calculate_errors(row, fly_cols), axis=1)
+
+    # --------------------------
+    # Outright Rates Results
+    # --------------------------
+    st.header("Overall Curve Performance Metrics (Outright Rates)")
+    overall_rmse_rates = results_df['Daily_RMSE_Rates'].mean()
+    overall_mae_rates = results_df['Daily_MAE_Rates'].mean()
 
     col1, col2 = st.columns(2)
-    col1.metric("Average Daily Curve RMSE", f"{overall_rmse:.4f}")
-    col2.metric("Average Daily Curve MAE", f"{overall_mae:.4f}")
+    col1.metric("Average Daily Curve RMSE (Rates)", f"{overall_rmse_rates:.4f}")
+    col2.metric("Average Daily Curve MAE (Rates)", f"{overall_mae_rates:.4f}")
 
     st.markdown("---")
-    st.header("Daily Curve Performance Visualization")
+    st.header("Daily Curve Performance Visualization (Outright Rates)")
     st.write("Select a date from the backtest to visually inspect the model's forecast against the actual yield curve.")
 
     unique_dates = results_df['Date'].dt.date.unique()
-    # Setup grid
     std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
     
-    # --- Date Navigation ---
     prev_col, date_col, next_col = st.columns([1, 4, 1])
-
     if prev_col.button("◀ Previous"):
         if st.session_state.selected_date_index > 0:
             st.session_state.selected_date_index -= 1
-
     if next_col.button("Next ▶"):
         if st.session_state.selected_date_index < len(unique_dates) - 1:
             st.session_state.selected_date_index += 1
     
-    # Ensure index is not out of bounds if results change
     if st.session_state.selected_date_index >= len(unique_dates):
         st.session_state.selected_date_index = len(unique_dates) - 1
 
@@ -338,17 +412,14 @@ if st.session_state.results_df is not None:
         key='date_selector'
     )
     
-    # Update session state if selectbox is changed manually
-    # This ensures buttons and selectbox are always in sync
     new_index = list(unique_dates).index(st.session_state.date_selector)
     st.session_state.selected_date_index = new_index
 
     if selected_date:
         plot_data = results_df[results_df['Date'].dt.date == selected_date]
-
         if not plot_data.empty:
-            actual_c = plot_data['Actual_Curve'].iloc[0]
-            pred_c = plot_data['Predicted_Curve'].iloc[0]
+            actual_c = plot_data['Actual_Curve'].iloc[0][np.isin(all_cols, std_cols)]
+            pred_c = plot_data['Predicted_Curve'].iloc[0][np.isin(all_cols, std_cols)]
 
             fig, ax = plt.subplots(figsize=(14, 7))
             ax.plot(std_arr, actual_c, label=f"Actual on {selected_date}", color='royalblue', marker='o', linestyle='-')
@@ -365,9 +436,98 @@ if st.session_state.results_df is not None:
             st.pyplot(fig)
 
     st.markdown("---")
-    st.subheader("Raw Curve Data")
+    st.subheader("Raw Curve Data (Outright Rates)")
     st.write("This table contains the raw predicted and actual curve vectors for each day of the backtest.")
-    st.dataframe(results_df)
+    raw_rates_df = pd.DataFrame(results_df['Date']).set_index('Date')
+    raw_rates_df['Predicted_Rates'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, std_cols)], index=std_cols).to_dict())
+    raw_rates_df['Actual_Rates'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, std_cols)], index=std_cols).to_dict())
+    st.dataframe(raw_rates_df)
+
+
+    # --------------------------
+    # Spreads and Flies Results
+    # --------------------------
+    st.markdown("---")
+    st.header("Backtesting Results for Spreads and Flies")
+    st.write("This section shows the backtesting performance on the model's ability to forecast spreads and butterflies.")
+    
+    col3, col4 = st.columns(2)
+    col3.metric("Average Daily Curve RMSE (Spreads)", f"{results_df['Daily_RMSE_Spreads'].mean():.4f}")
+    col4.metric("Average Daily Curve MAE (Spreads)", f"{results_df['Daily_MAE_Spreads'].mean():.4f}")
+
+    col5, col6 = st.columns(2)
+    col5.metric("Average Daily Curve RMSE (Flies)", f"{results_df['Daily_RMSE_Flies'].mean():.4f}")
+    col6.metric("Average Daily Curve MAE (Flies)", f"{results_df['Daily_MAE_Flies'].mean():.4f}")
+
+
+    st.markdown("---")
+    st.subheader("Daily Performance Visualization (Spreads and Flies)")
+    st.write("Select a date to visualize the predicted vs. actual spread and fly values.")
+
+    prev_col, spread_date_col, next_col = st.columns([1, 4, 1])
+    if prev_col.button("◀ Previous", key="spread_prev"):
+        if st.session_state.selected_spread_date_index > 0:
+            st.session_state.selected_spread_date_index -= 1
+    if next_col.button("Next ▶", key="spread_next"):
+        if st.session_state.selected_spread_date_index < len(unique_dates) - 1:
+            st.session_state.selected_spread_date_index += 1
+    
+    if st.session_state.selected_spread_date_index >= len(unique_dates):
+        st.session_state.selected_spread_date_index = len(unique_dates) - 1
+    
+    selected_spread_date = spread_date_col.selectbox(
+        "Select a date to inspect",
+        options=unique_dates,
+        index=st.session_state.selected_spread_date_index,
+        key='spread_date_selector'
+    )
+    
+    new_spread_index = list(unique_dates).index(st.session_state.spread_date_selector)
+    st.session_state.selected_spread_date_index = new_spread_index
+
+    if selected_spread_date:
+        plot_data = results_df[results_df['Date'].dt.date == selected_spread_date]
+        if not plot_data.empty:
+            actual_spreads = plot_data['Actual_Curve'].iloc[0][np.isin(all_cols, spread_cols)]
+            pred_spreads = plot_data['Predicted_Curve'].iloc[0][np.isin(all_cols, spread_cols)]
+            actual_flies = plot_data['Actual_Curve'].iloc[0][np.isin(all_cols, fly_cols)]
+            pred_flies = plot_data['Predicted_Curve'].iloc[0][np.isin(all_cols, fly_cols)]
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # Spreads Plot
+            ax1.plot(spread_cols, actual_spreads, marker='o', linestyle='-', color='royalblue', label=f"Actual Spreads")
+            ax1.plot(spread_cols, pred_spreads, marker='x', linestyle='--', color='darkorange', label="Predicted Spreads")
+            ax1.set_title(f"Spread Forecast vs. Actual for {selected_spread_date}")
+            ax1.set_ylabel("Spread (bps)")
+            ax1.set_xlabel("Spread (Years)")
+            ax1.set_xticklabels(spread_cols, rotation=45, ha="right")
+            ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+            ax1.legend()
+            
+            # Flies Plot
+            ax2.plot(fly_cols, actual_flies, marker='o', linestyle='-', color='royalblue', label=f"Actual Flies")
+            ax2.plot(fly_cols, pred_flies, marker='x', linestyle='--', color='darkorange', label="Predicted Flies")
+            ax2.set_title(f"Butterfly Forecast vs. Actual for {selected_spread_date}")
+            ax2.set_ylabel("Fly (bps)")
+            ax2.set_xlabel("Fly (Years)")
+            ax2.set_xticklabels(fly_cols, rotation=45, ha="right")
+            ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+            ax2.legend()
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+
+    st.markdown("---")
+    st.subheader("Raw Curve Data (Spreads and Flies)")
+    st.write("This table contains the raw predicted and actual spread and fly vectors for each day of the backtest.")
+    
+    raw_spreads_flies_df = pd.DataFrame(results_df['Date']).set_index('Date')
+    raw_spreads_flies_df['Predicted_Spreads'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, spread_cols)], index=spread_cols).to_dict())
+    raw_spreads_flies_df['Actual_Spreads'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, spread_cols)], index=spread_cols).to_dict())
+    raw_spreads_flies_df['Predicted_Flies'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, fly_cols)], index=fly_cols).to_dict())
+    raw_spreads_flies_df['Actual_Flies'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, fly_cols)], index=fly_cols).to_dict())
+
+    st.dataframe(raw_spreads_flies_df)
 else:
     st.info("Upload files, configure the backtest parameters, and click **Run Backtest**.")
-

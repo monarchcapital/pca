@@ -253,7 +253,7 @@ if run_backtest and st.session_state.results_df is None:
     # --------------------------
     st.title("Backtest Results")
     results = []
-
+    
     # Prepare date ranges
     backtest_range = pd.bdate_range(start=backtest_start_date, end=backtest_end_date)
     all_available_dates = yields_df.index
@@ -271,7 +271,7 @@ if run_backtest and st.session_state.results_df is None:
 
         training_end_date = current_date - pd.Timedelta(days=1)
         training_start_date = training_end_date - pd.DateOffset(days=training_window_days * 1.5)
-
+        
         train_mask = (yields_df.index >= training_start_date) & (yields_df.index <= training_end_date)
         yields_df_train = yields_df.loc[train_mask].sort_index().tail(training_window_days)
 
@@ -280,7 +280,7 @@ if run_backtest and st.session_state.results_df is None:
 
         # Build the full PCA matrix (rates, spreads, flies)
         pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
-
+        
         if pca_df_filled.empty: continue
 
         scaler = StandardScaler(with_std=False)
@@ -300,45 +300,30 @@ if run_backtest and st.session_state.results_df is None:
                 pcs_next = forecast_pcs_var(PCs_df, lags=var_lags)
             else: # ARIMA
                 pcs_next = forecast_pcs_arima(PCs_df)
-
+            
             last_actual_full_curve = pca_df_filled.iloc[-1].values
             last_pcs = PCs_df.iloc[-1].values.reshape(1, -1)
             delta_pcs = pcs_next - last_pcs
             delta_curve = pca.inverse_transform(delta_pcs)
             pred_full_curve = last_actual_full_curve + delta_curve.flatten()
 
-        # --- START of Code Changes ---
-        # Get the raw interpolated rates for the actual date
-        actual_series_on_grid = row_to_std_grid(
-            current_date,
-            yields_df.loc[current_date],
-            yields_df.columns,
-            expiry_df,
-            std_arr,
-            holidays_np,
-            year_basis,
-            rate_unit,
-            interp_method
-        )
-
-        # Re-calculate spreads and flies on the RAW interpolated rates
+        actual_series_on_grid = row_to_std_grid(current_date, yields_df.loc[current_date], yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        
+        # Build the actual full curve (rates, spreads, flies) for comparison
         actual_df = pd.DataFrame([actual_series_on_grid], columns=std_cols, index=[current_date])
         spread_cols = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
-        actual_df_spreads_raw = pd.DataFrame(np.nan, index=actual_df.index, columns=spread_cols, dtype=float)
+        actual_df_spreads = pd.DataFrame(np.nan, index=actual_df.index, columns=spread_cols, dtype=float)
         for j in range(1, len(std_cols)):
             col_name = f"{std_cols[j]}-{std_cols[j-1]}"
-            actual_df_spreads_raw[col_name] = actual_df[std_cols[j]] - actual_df[std_cols[j-1]]
+            actual_df_spreads[col_name] = actual_df[std_cols[j]] - actual_df[std_cols[j-1]]
 
         fly_cols = [f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}" for j in range(1, len(std_cols) - 1)]
-        actual_df_flies_raw = pd.DataFrame(np.nan, index=actual_df.index, columns=fly_cols, dtype=float)
+        actual_df_flies = pd.DataFrame(np.nan, index=actual_df.index, columns=fly_cols, dtype=float)
         for j in range(1, len(std_cols) - 1):
             col_name = f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}"
-            actual_df_flies_raw[col_name] = (actual_df[std_cols[j+1]] - actual_df[std_cols[j]]) - (actual_df[std_cols[j]] - actual_df[std_cols[j-1]])
+            actual_df_flies[col_name] = (actual_df[std_cols[j+1]] - actual_df[std_cols[j]]) - (actual_df[std_cols[j]] - actual_df[std_cols[j-1]])
 
-        # Combine the raw actual rates, spreads, and flies
-        actual_full_curve = pd.concat([actual_df, actual_df_spreads_raw, actual_df_flies_raw], axis=1).iloc[0].values
-        
-        # --- END of Code Changes ---
+        actual_full_curve = pd.concat([actual_df, actual_df_spreads, actual_df_flies], axis=1).iloc[0].values
 
         results.append({
             "Date": current_date,
@@ -352,7 +337,7 @@ if run_backtest and st.session_state.results_df is None:
 
     status_text.success("Backtest complete!")
     progress_bar.empty()
-
+    
     if results:
         st.session_state.results_df = pd.DataFrame(results)
 

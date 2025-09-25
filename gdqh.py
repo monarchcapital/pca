@@ -257,23 +257,6 @@ if 'selected_date_index' not in st.session_state:
 if 'selected_spread_date_index' not in st.session_state:
     st.session_state.selected_spread_date_index = 0
 
-# --- Callbacks for Next/Prev Buttons ---
-def next_date():
-    if st.session_state.selected_date_index < len(st.session_state.unique_dates) - 1:
-        st.session_state.selected_date_index += 1
-
-def prev_date():
-    if st.session_state.selected_date_index > 0:
-        st.session_state.selected_date_index -= 1
-
-def next_spread_date():
-    if st.session_state.selected_spread_date_index < len(st.session_state.unique_dates) - 1:
-        st.session_state.selected_spread_date_index += 1
-
-def prev_spread_date():
-    if st.session_state.selected_spread_date_index > 0:
-        st.session_state.selected_spread_date_index -= 1
-
 # --- Run/Reset Buttons ---
 st.sidebar.markdown("---")
 col1, col2 = st.sidebar.columns(2)
@@ -488,18 +471,27 @@ if st.session_state.results_df is not None:
     unique_dates = results_df['Date'].dt.date.unique()
     std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
     
-    st.session_state.unique_dates = unique_dates # Store unique dates in session state for callbacks
-    
     prev_col, date_col, next_col = st.columns([1, 4, 1])
-    prev_col.button("◀ Previous", on_click=prev_date)
-    next_col.button("Next ▶", on_click=next_date)
+    if prev_col.button("◀ Previous"):
+        if st.session_state.selected_date_index > 0:
+            st.session_state.selected_date_index -= 1
+    if next_col.button("Next ▶"):
+        if st.session_state.selected_date_index < len(unique_dates) - 1:
+            st.session_state.selected_date_index += 1
     
+    if st.session_state.selected_date_index >= len(unique_dates):
+        st.session_state.selected_date_index = len(unique_dates) - 1
+
     selected_date = date_col.selectbox(
         "Select a date to inspect",
         options=unique_dates,
-        index=st.session_state.selected_date_index
+        index=st.session_state.selected_date_index,
+        key='date_selector'
     )
     
+    new_index = list(unique_dates).index(st.session_state.date_selector)
+    st.session_state.selected_date_index = new_index
+
     if selected_date:
         plot_data = results_df[results_df['Date'].dt.date == selected_date]
         if not plot_data.empty:
@@ -555,15 +547,26 @@ if st.session_state.results_df is not None:
     st.write("Select a date to visualize the predicted vs. actual spread and fly values.")
 
     prev_col, spread_date_col, next_col = st.columns([1, 4, 1])
-    prev_col.button("◀ Previous", key="spread_prev", on_click=prev_spread_date)
-    next_col.button("Next ▶", key="spread_next", on_click=next_spread_date)
+    if prev_col.button("◀ Previous", key="spread_prev"):
+        if st.session_state.selected_spread_date_index > 0:
+            st.session_state.selected_spread_date_index -= 1
+    if next_col.button("Next ▶", key="spread_next"):
+        if st.session_state.selected_spread_date_index < len(unique_dates) - 1:
+            st.session_state.selected_spread_date_index += 1
+    
+    if st.session_state.selected_spread_date_index >= len(unique_dates):
+        st.session_state.selected_spread_date_index = len(unique_dates) - 1
     
     selected_spread_date = spread_date_col.selectbox(
         "Select a date to inspect",
         options=unique_dates,
-        index=st.session_state.selected_spread_date_index
+        index=st.session_state.selected_spread_date_index,
+        key='spread_date_selector'
     )
     
+    new_spread_index = list(unique_dates).index(st.session_state.spread_date_selector)
+    st.session_state.selected_spread_date_index = new_spread_index
+
     if selected_spread_date:
         plot_data = results_df[results_df['Date'].dt.date == selected_spread_date]
         if not plot_data.empty:

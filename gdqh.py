@@ -554,7 +554,7 @@ if st.session_state.results_df is not None:
     st.markdown("---")
     st.subheader("Daily Performance Visualization (Spreads and Flies)")
     st.write("Select a date to visualize the predicted vs. actual spread and fly values.")
-    
+
     prev_col, spread_date_col, next_col = st.columns([1, 4, 1])
     prev_col.button("◀ Previous", key="spread_prev", on_click=prev_spread_date)
     next_col.button("Next ▶", key="spread_next", on_click=next_spread_date)

@@ -42,7 +42,28 @@ plt.rcParams["figure.dpi"] = 120
 # to ensure the backtest accurately reflects the main tool's logic.
 
 def safe_to_datetime(s):
-    return pd.to_datetime(s, errors='coerce', dayfirst=False)
+    """
+    Robustly converts a string to a datetime object by trying multiple common formats.
+    """
+    if pd.isna(s):
+        return pd.NaT
+    
+    # List of formats to try in order of priority
+    formats_to_try = [
+        '%m/%d/%Y', '%m-%d-%Y',  # Month-first formats
+        '%d/%m/%Y', '%d-%m-%Y',  # Day-first formats
+        '%Y/%m/%d', '%Y-%m-%d',  # Year-first formats
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except (ValueError, TypeError):
+            continue
+    
+    # Fallback to general parser if specific formats fail
+    return pd.to_datetime(s, errors='coerce')
+
 
 def normalize_rate_input(val, unit):
     if pd.isna(val): return np.nan
@@ -152,6 +173,58 @@ def build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basi
     return pd.DataFrame(pca_vals, index=pca_df_combined.index, columns=pca_df_combined.columns)
 
 
+def calculate_raw_metrics(dt, row_series, available_contracts, expiry_df, rate_unit, holidays_np, year_basis):
+    """
+    Calculates rates, spreads, and flies directly from raw, non-interpolated data
+    by mapping standard maturities to the first, second, third, etc. available
+    live contracts.
+    """
+    std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
+    
+    # Create a sorted list of available raw contracts and their rates for the current day
+    raw_data = []
+    for col in available_contracts:
+        mat_up = str(col).strip().upper()
+        if mat_up not in expiry_df.index: continue
+        exp = expiry_df.loc[mat_up, "DATE"]
+        if pd.isna(exp) or pd.Timestamp(exp).date() <= dt.date(): continue
+        raw_val = row_series.get(col, np.nan)
+        if pd.isna(raw_val): continue
+        rate_percent = denormalize_to_percent(normalize_rate_input(raw_val, rate_unit))
+        raw_data.append({'maturity': mat_up, 'expiry': exp, 'rate': rate_percent})
+
+    # Sort the data by expiry date to ensure we get them in the correct sequence
+    raw_data.sort(key=lambda x: x['expiry'])
+    
+    # Map each standard maturity to the correct sequential live contract
+    rates_map = {std_arr[i]: np.nan for i in range(len(std_arr))}
+    for i in range(len(std_arr)):
+        if i < len(raw_data):
+            rates_map[std_arr[i]] = raw_data[i]['rate']
+    
+    rates = np.array([rates_map.get(t, np.nan) for t in std_arr])
+    
+    spreads = np.full(len(std_arr) - 1, np.nan)
+    flies = np.full(len(std_arr) - 2, np.nan)
+
+    # Correctly calculate spreads from the mapped rates
+    for i in range(len(spreads)):
+        rate1 = rates[i+1]
+        rate2 = rates[i]
+        if not np.isnan(rate1) and not np.isnan(rate2):
+            spreads[i] = rate1 - rate2
+
+    # Correctly calculate flies from the mapped rates
+    for i in range(len(flies)):
+        rate1 = rates[i+2]
+        rate2 = rates[i+1]
+        rate3 = rates[i]
+        if not np.isnan(rate1) and not np.isnan(rate2) and not np.isnan(rate3):
+            flies[i] = (rate1 - rate2) - (rate2 - rate3)
+            
+    return rates, spreads, flies
+
+
 # --------------------------
 # Sidebar — Inputs
 # --------------------------
@@ -222,7 +295,7 @@ if run_backtest and st.session_state.results_df is None:
         # Yields
         yields_df = pd.read_csv(io.StringIO(yield_file.getvalue().decode("utf-8")))
         date_col = yields_df.columns[0]
-        yields_df[date_col] = safe_to_datetime(yields_df[date_col])
+        yields_df[date_col] = yields_df[date_col].apply(safe_to_datetime)
         yields_df = yields_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
         yields_df.columns = [str(c).strip() for c in yields_df.columns]
         for c in yields_df.columns:
@@ -233,14 +306,14 @@ if run_backtest and st.session_state.results_df is None:
         expiry_df = expiry_raw.iloc[:, :2].copy()
         expiry_df.columns = ["MATURITY", "DATE"]
         expiry_df["MATURITY"] = expiry_df["MATURITY"].astype(str).str.strip().str.upper()
-        expiry_df["DATE"] = safe_to_datetime(expiry_df["DATE"])
+        expiry_df["DATE"] = expiry_df["DATE"].apply(safe_to_datetime)
         expiry_df = expiry_df.dropna(subset=["DATE"]).set_index("MATURITY")
 
         # Holidays
         holidays_np = np.array([], dtype="datetime64[D]")
         if holiday_file:
             hol_df = pd.read_csv(io.StringIO(holiday_file.getvalue().decode("utf-8")))
-            hol_series = safe_to_datetime(hol_df.iloc[:, 0]).dropna()
+            hol_series = hol_df.iloc[:, 0].apply(safe_to_datetime).dropna()
             if not hol_series.empty:
                 holidays_np = np.array(hol_series.dt.date, dtype="datetime64[D]")
                 
@@ -261,6 +334,10 @@ if run_backtest and st.session_state.results_df is None:
     # Setup grid
     std_arr = np.array(build_std_grid_by_rule(7.0), dtype=float)
     std_cols = [f"{m:.2f}Y" for m in std_arr]
+    
+    spread_cols_pca = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
+    fly_cols_pca = [f"{std_cols[i+1]}-{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols) - 1)]
+    all_cols_full = std_cols + spread_cols_pca + fly_cols_pca
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -278,7 +355,7 @@ if run_backtest and st.session_state.results_df is None:
         if len(yields_df_train) < training_window_days / 2:
             continue
 
-        # Build the full PCA matrix (rates, spreads, flies)
+        # Build the full PCA matrix (rates, spreads, flies) from interpolated training data
         pca_df_filled = build_pca_matrix(yields_df_train, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
         
         if pca_df_filled.empty: continue
@@ -307,29 +384,29 @@ if run_backtest and st.session_state.results_df is None:
             delta_curve = pca.inverse_transform(delta_pcs)
             pred_full_curve = last_actual_full_curve + delta_curve.flatten()
 
-        actual_series_on_grid = row_to_std_grid(current_date, yields_df.loc[current_date], yields_df.columns, expiry_df, std_arr, holidays_np, year_basis, rate_unit, interp_method)
+        # Build the ACTUAL curve for comparison using RAW data for all components
+        actual_rates_raw, actual_spreads_raw, actual_flies_raw = calculate_raw_metrics(
+            current_date, 
+            yields_df.loc[current_date], 
+            yields_df.columns, 
+            expiry_df, 
+            rate_unit,
+            holidays_np, 
+            year_basis
+        )
         
-        # Build the actual full curve (rates, spreads, flies) for comparison
-        actual_df = pd.DataFrame([actual_series_on_grid], columns=std_cols, index=[current_date])
-        spread_cols = [f"{std_cols[i]}-{std_cols[i-1]}" for i in range(1, len(std_cols))]
-        actual_df_spreads = pd.DataFrame(np.nan, index=actual_df.index, columns=spread_cols, dtype=float)
-        for j in range(1, len(std_cols)):
-            col_name = f"{std_cols[j]}-{std_cols[j-1]}"
-            actual_df_spreads[col_name] = actual_df[std_cols[j]] - actual_df[std_cols[j-1]]
-
-        fly_cols = [f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}" for j in range(1, len(std_cols) - 1)]
-        actual_df_flies = pd.DataFrame(np.nan, index=actual_df.index, columns=fly_cols, dtype=float)
-        for j in range(1, len(std_cols) - 1):
-            col_name = f"{std_cols[j+1]}-{std_cols[j]}-{std_cols[j-1]}"
-            actual_df_flies[col_name] = (actual_df[std_cols[j+1]] - actual_df[std_cols[j]]) - (actual_df[std_cols[j]] - actual_df[std_cols[j-1]])
-
-        actual_full_curve = pd.concat([actual_df, actual_df_spreads, actual_df_flies], axis=1).iloc[0].values
+        actual_full_curve_series = pd.Series(
+            np.concatenate([actual_rates_raw, actual_spreads_raw, actual_flies_raw]), 
+            index=all_cols_full
+        )
+        
+        actual_full_curve = actual_full_curve_series.values
 
         results.append({
             "Date": current_date,
             "Predicted_Curve": pred_full_curve,
             "Actual_Curve": actual_full_curve,
-            "Column_Names": pca_df_filled.columns.tolist()
+            "Column_Names": all_cols_full
         })
 
         progress_bar.progress((i + 1) / len(backtest_range))
@@ -368,8 +445,8 @@ if st.session_state.results_df is not None:
         actual = row['Actual_Curve'][np.isin(all_cols, cols)]
         if np.isnan(actual).all(): return np.nan
         return pd.Series({
-            'RMSE': np.sqrt(np.mean((pred - actual)**2)),
-            'MAE': np.mean(np.abs(pred - actual))
+            'RMSE': np.sqrt(np.nanmean((pred - actual)**2)),
+            'MAE': np.nanmean(np.abs(pred - actual))
         })
     
     results_df[['Daily_RMSE_Rates', 'Daily_MAE_Rates']] = results_df.apply(lambda row: calculate_errors(row, std_cols), axis=1)
@@ -438,9 +515,14 @@ if st.session_state.results_df is not None:
     st.markdown("---")
     st.subheader("Raw Curve Data (Outright Rates)")
     st.write("This table contains the raw predicted and actual curve vectors for each day of the backtest.")
+    
     raw_rates_df = pd.DataFrame(results_df['Date']).set_index('Date')
-    raw_rates_df['Predicted_Rates'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, std_cols)], index=std_cols).to_dict())
-    raw_rates_df['Actual_Rates'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, std_cols)], index=std_cols).to_dict())
+    
+    # Extract predicted and actual rates into their own columns
+    for i, col in enumerate(std_cols):
+        raw_rates_df[f"Predicted_{col}"] = results_df['Predicted_Curve'].apply(lambda x: x[i])
+        raw_rates_df[f"Actual_{col}"] = results_df['Actual_Curve'].apply(lambda x: x[i])
+
     st.dataframe(raw_rates_df)
 
 
@@ -523,10 +605,21 @@ if st.session_state.results_df is not None:
     st.write("This table contains the raw predicted and actual spread and fly vectors for each day of the backtest.")
     
     raw_spreads_flies_df = pd.DataFrame(results_df['Date']).set_index('Date')
-    raw_spreads_flies_df['Predicted_Spreads'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, spread_cols)], index=spread_cols).to_dict())
-    raw_spreads_flies_df['Actual_Spreads'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, spread_cols)], index=spread_cols).to_dict())
-    raw_spreads_flies_df['Predicted_Flies'] = results_df['Predicted_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, fly_cols)], index=fly_cols).to_dict())
-    raw_spreads_flies_df['Actual_Flies'] = results_df['Actual_Curve'].apply(lambda x: pd.Series(x[np.isin(all_cols, fly_cols)], index=fly_cols).to_dict())
+    
+    # Get the start and end indices for spreads and flies within the full curve vector
+    spreads_start_idx = len(std_cols)
+    spreads_end_idx = spreads_start_idx + len(spread_cols)
+    flies_start_idx = spreads_end_idx
+    flies_end_idx = flies_start_idx + len(fly_cols)
+
+    # Extract predicted and actual spreads and flies into their own columns
+    for i, col in enumerate(spread_cols):
+        raw_spreads_flies_df[f"Predicted_Spread_{col}"] = results_df['Predicted_Curve'].apply(lambda x: x[spreads_start_idx + i])
+        raw_spreads_flies_df[f"Actual_Spread_{col}"] = results_df['Actual_Curve'].apply(lambda x: x[spreads_start_idx + i])
+        
+    for i, col in enumerate(fly_cols):
+        raw_spreads_flies_df[f"Predicted_Fly_{col}"] = results_df['Predicted_Curve'].apply(lambda x: x[flies_start_idx + i])
+        raw_spreads_flies_df[f"Actual_Fly_{col}"] = results_df['Actual_Curve'].apply(lambda x: x[flies_start_idx + i])
 
     st.dataframe(raw_spreads_flies_df)
 else:
